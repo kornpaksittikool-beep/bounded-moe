@@ -1,0 +1,2073 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 6f5fe377d..57ac34142 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -3,6 +3,7 @@
+ #include "build-info.h"
+ #include "chat.h"
+ #include "common.h"
++#include "ggml-cpu.h"
+ #include "download.h"
+ #include "json-schema-to-grammar.h"
+ #include "llama.h"
+@@ -2731,11 +2732,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             if (value < 0) {
+                 throw std::invalid_argument("invalid value");
+             }
++            // B1B_MOE_REPACK=1 routes the CPU MoE weights through the repack buffer type so
++            // they use the packed Q4_K GEMM kernels instead of the plain vec_dot path.
++            ggml_backend_buffer_type_t moe_buft = ggml_backend_cpu_buffer_type();
++            const char * repack_env = std::getenv("B1B_MOE_REPACK");
++            if (repack_env && repack_env[0] == '1') {
++                ggml_backend_buffer_type_t repack = ggml_backend_cpu_repack_buffer_type_public();
++                if (repack) {
++                    moe_buft = repack;
++                } else {
++                    fprintf(stderr, "B1B_MOE_REPACK requested but the repack buffer type is unavailable\n");
++                }
++            }
+             for (int i = 0; i < value; ++i) {
+                 // keep strings alive and avoid leaking memory by storing them in a static vector
+                 static std::list<std::string> buft_overrides;
+                 buft_overrides.push_back(llm_ffn_exps_block_regex(i));
+-                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), ggml_backend_cpu_buffer_type()});
++                params.tensor_buft_overrides.push_back({buft_overrides.back().c_str(), moe_buft});
+             }
+         }
+     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index b7110fa12..a89160712 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -329,6 +329,8 @@ set(GGML_PUBLIC_HEADERS
+     include/ggml-cann.h
+     include/ggml-cpp.h
+     include/ggml-cuda.h
++        include/ggml-routing-trace.h
++        include/ggml-expert-indirection.h
+     include/ggml-opt.h
+     include/ggml-metal.h
+     include/ggml-rpc.h
+diff --git a/ggml/include/ggml-backend.h b/ggml/include/ggml-backend.h
+index cc3f8cd36..b9df22d47 100644
+--- a/ggml/include/ggml-backend.h
++++ b/ggml/include/ggml-backend.h
+@@ -432,6 +432,17 @@ extern "C" {
+     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
+     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
+ 
++    // Development-only external storage skeleton. The returned buffer reserves
++    // virtual address space but does not commit tensor contents.
++    GGML_API ggml_backend_buffer_t      ggml_backend_cpu_external_expert_buffer(size_t logical_size,
++                                                                                   size_t * reserved_size,
++                                                                                   size_t * committed_size);
++    GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_external_expert_buffer_type(void);
++    GGML_API bool                       ggml_backend_buft_is_external_expert(ggml_backend_buffer_type_t buft);
++    GGML_API bool                       ggml_backend_buffer_is_external_expert(ggml_backend_buffer_t buffer);
++    GGML_API bool                       ggml_backend_buffer_external_expert_details(ggml_backend_buffer_t buffer,
++            void ** context, void ** base, size_t * reserved);
++
+ #ifdef  __cplusplus
+ }
+ #endif
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index dc6453c6e..041528b29 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -140,6 +140,10 @@ extern "C" {
+ 
+     GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
+ 
++    // Repack buffer type, when the CPU backend was built with GGML_CPU_REPACK.
++    // Returns NULL otherwise. Weights placed here use the packed Q4_0/Q4_K GEMM kernels.
++    GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_public(void);
++
+     GGML_BACKEND_API void ggml_cpu_fp32_to_fp32(const float *,       float *, int64_t);
+     GGML_BACKEND_API void ggml_cpu_fp32_to_i32 (const float *,     int32_t *, int64_t);
+     GGML_BACKEND_API void ggml_cpu_fp32_to_fp16(const float *, ggml_fp16_t *, int64_t);
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 82e9480c2..c6c31cc5d 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -199,14 +199,16 @@ add_library(ggml-base
+             ggml.c
+             ggml.cpp
+             ggml-alloc.c
+-            ggml-backend.cpp
++        ggml-backend.cpp
++        ggml-expert-indirection.cpp
+             ggml-backend-meta.cpp
+             ggml-opt.cpp
+             ggml-threading.cpp
+             ggml-threading.h
+             ggml-quants.c
+             ggml-quants.h
+-            gguf.cpp)
++            gguf.cpp
++            ggml-routing-trace.cpp)
+ 
+ set_target_properties(ggml-base PROPERTIES
+     VERSION ${GGML_VERSION}
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 7654ea1f3..d34921f19 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -10,6 +10,8 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <map>
+ #include <memory>
+@@ -1499,7 +1501,19 @@ static const ggml_backend_buffer_i ggml_backend_meta_buffer_iface = {
+ };
+ 
+ bool ggml_backend_buffer_is_meta(ggml_backend_buffer_t buf) {
+-    return buf != nullptr && buf->iface.free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
++    const char * trace_env = std::getenv("B1B_TRACE_BUFFER_BOUNDARY");
++    const bool trace_boundary = trace_env && trace_env[0] == '1';
++    if (trace_boundary) { std::fprintf(stderr, "B1B_IS_META_ENTER buffer=%p\n", (void *) buf); std::fflush(stderr); }
++    if (buf == nullptr) {
++        if (trace_boundary) { std::fprintf(stderr, "B1B_IS_META_RETURN result=0 buffer=%p\n", (void *) buf); std::fflush(stderr); }
++        return false;
++    }
++    if (trace_boundary) { std::fprintf(stderr, "B1B_IS_META_FIELD_READ_BEGIN buffer=%p\n", (void *) buf); std::fflush(stderr); }
++    const auto free_buffer = buf->iface.free_buffer;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_IS_META_FIELD_READ_END free_buffer=%p buffer=%p\n", (void *) free_buffer, (void *) buf); std::fflush(stderr); }
++    const bool result = free_buffer == ggml_backend_meta_buffer_iface.free_buffer;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_IS_META_RETURN result=%d buffer=%p\n", result ? 1 : 0, (void *) buf); std::fflush(stderr); }
++    return result;
+ }
+ 
+ static ggml_backend_buffer_t ggml_backend_meta_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f6fb91798..c181f1fb8 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -10,6 +10,34 @@
+ 
+ #include "ggml-backend.h"
+ #include "ggml-backend-impl.h"
++
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++extern "C" void ggml_expert_b1b_helper_breadcrumb(uint32_t stage, uint32_t substage);
++extern "C" void ggml_expert_b1b_helper_breadcrumb_ptr(uint32_t stage, uint32_t substage, uintptr_t ptr);
++extern "C" uint32_t ggml_expert_b1b_buffer_created(uintptr_t ptr, uintptr_t tensor);
++extern "C" void ggml_expert_b1b_buffer_freed(uintptr_t ptr);
++extern "C" uint32_t ggml_expert_b1b_buffer_state(uintptr_t ptr);
++extern "C" void ggml_expert_b1b_prov(uint32_t slot, uintptr_t value);
++
++static bool b1b_buffer_trace_target(const ggml_tensor * tensor) {
++    const char * e = std::getenv("B1B_TRACE_BUFFER_WRITES");
++    return e && e[0] == '1' && tensor && std::strcmp(ggml_get_name(tensor), "blk.0.ffn_gate_exps.weight") == 0;
++}
++
++static void b1b_log_buffer_write(const char * site, const ggml_tensor * tensor, ggml_backend_buffer_t before, ggml_backend_buffer_t after) {
++    if (!b1b_buffer_trace_target(tensor)) return;
++    std::fprintf(stderr,
++        "B1B_TBUFFER_WRITE site=%s tensor=%p field=%p sizeof_tensor=%zu buffer_offset=%zu before=%p after=%p data=%p view_src=%p\n",
++        site, (const void *) tensor, (void *) &tensor->buffer, sizeof(ggml_tensor), offsetof(ggml_tensor, buffer),
++        (void *) before, (void *) after, tensor->data, (void *) tensor->view_src);
++    std::fflush(stderr);
++}
++#include "ggml-expert-indirection.h"
++#include "ggml-routing-trace.h"
+ #include "ggml-alloc.h"
+ #include "ggml-impl.h"
+ 
+@@ -109,6 +137,8 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
+         return;
+     }
+ 
++    ggml_expert_b1b_buffer_freed((uintptr_t) buffer);
++
+     if (buffer->iface.free_buffer != NULL) {
+         buffer->iface.free_buffer(buffer);
+     }
+@@ -116,27 +146,58 @@ void ggml_backend_buffer_free(ggml_backend_buffer_t buffer) {
+ }
+ 
+ size_t ggml_backend_buffer_get_size(ggml_backend_buffer_t buffer) {
++    const char * trace_env = std::getenv("B1B_TRACE_BUFFER_BOUNDARY");
++    const bool trace_boundary = trace_env && trace_env[0] == '1';
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_SIZE_ENTER buffer=%p\n", (void *) buffer); std::fflush(stderr); }
+     GGML_ASSERT(buffer);
+-    return buffer->size;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_SIZE_FIELD_READ_BEGIN buffer=%p\n", (void *) buffer); std::fflush(stderr); }
++    const size_t size = buffer->size;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_SIZE_FIELD_READ_END size=%zu buffer=%p\n", size, (void *) buffer); std::fflush(stderr); }
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_SIZE_RETURN size=%zu buffer=%p\n", size, (void *) buffer); std::fflush(stderr); }
++    return size;
+ }
+ 
+ void * ggml_backend_buffer_get_base(ggml_backend_buffer_t buffer) {
++    const bool trace_boundary = []() {
++        const char * e = std::getenv("B1B_TRACE_BUFFER_BOUNDARY");
++        return e && e[0] == '1';
++    }();
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_GET_BASE_ENTER buffer=%p\n", (void *) buffer);
++        std::fflush(stderr);
++    }
+     GGML_ASSERT(buffer);
+     // get_base is optional if the buffer is zero-sized
+-    if (!ggml_backend_buffer_is_meta(buffer) && buffer->size == 0) {
+-        return NULL;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_META_BEGIN buffer=%p\n", (void *) buffer); std::fflush(stderr); }
++    const bool is_meta = ggml_backend_buffer_is_meta(buffer);
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_META_END is_meta=%d buffer=%p\n", is_meta ? 1 : 0, (void *) buffer); std::fflush(stderr); }
++    if (!is_meta) {
++        if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_SIZE_READ_BEGIN buffer=%p\n", (void *) buffer); std::fflush(stderr); }
++        const size_t buffer_size = buffer->size;
++        if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_SIZE_READ_END size=%zu buffer=%p\n", buffer_size, (void *) buffer); std::fflush(stderr); }
++        if (buffer_size == 0) {
++            if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_RETURN base=%p buffer=%p\n", nullptr, (void *) buffer); std::fflush(stderr); }
++            return NULL;
++        }
+     }
+ 
+     // FIXME JG: a multi_buffer has a non-zero size, according to the above comment get_base is not optional,
+     //     I don't know whether the above comment is correct
+-    if (!buffer->iface.get_base) {
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_IFACE_READ_BEGIN buffer=%p\n", (void *) buffer); std::fflush(stderr); }
++    const auto get_base = buffer->iface.get_base;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_IFACE_READ_END fn=%p buffer=%p\n", (void *) get_base, (void *) buffer); std::fflush(stderr); }
++    if (!get_base) {
++        if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_RETURN base=%p buffer=%p\n", nullptr, (void *) buffer); std::fflush(stderr); }
+         return NULL;
+     }
+ 
+-    void * base = buffer->iface.get_base(buffer);
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_CALL_BEGIN fn=%p buffer=%p\n", (void *) get_base, (void *) buffer); std::fflush(stderr); }
++    void * base = get_base(buffer);
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_CALL_END base=%p buffer=%p\n", base, (void *) buffer); std::fflush(stderr); }
+ 
+     GGML_ASSERT(base != NULL && "backend buffer base cannot be NULL");
+ 
++    if (trace_boundary) { std::fprintf(stderr, "B1B_GET_BASE_RETURN base=%p buffer=%p\n", base, (void *) buffer); std::fflush(stderr); }
+     return base;
+ }
+ 
+@@ -1051,6 +1112,8 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
+     }
+ }
+ 
++static void ggml_backend_sched_b1b_probe_moe_nodes(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
++
+ // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
+ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+     // reset splits
+@@ -1424,6 +1487,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
+         sched->n_splits = i_split + 1;
+     }
+ 
++    ggml_backend_sched_b1b_probe_moe_nodes(sched, graph);
++
+     if (sched->debug) {
+         ggml_backend_sched_print_assignments(sched, graph);
+     }
+@@ -1673,6 +1738,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+                         prev_ids_tensor = ids_tensor;
+                     }
+ 
++                    // The host->GPU MoE copy path has the exact router IDs used by
++                    // the CUDA MUL_MAT_ID computation. Record one canonical gate
++                    // decision while the llama execution layer has tracing enabled.
++                    if (ggml_routing_trace_is_enabled() && input->name &&
++                        strstr(ggml_get_name(input), "ffn_gate_exps.weight") &&
++                        ids_tensor->ne[1] == 1) {
++                        int32_t selected[8];
++                        for (int i = 0; i < 8; ++i) {
++                            selected[i] = ids[i];
++                        }
++                        ggml_routing_trace_record(ggml_get_name(input), selected, 8);
++                    }
++
+                     // group consecutive experts and copy them together
+                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                         const size_t expert_offset = first_id * expert_size;
+@@ -2044,7 +2122,9 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
+     GGML_ASSERT(tensor->view_src->buffer != NULL);
+     GGML_ASSERT(tensor->view_src->data != NULL);
+ 
++    const ggml_backend_buffer_t before = tensor->buffer;
+     tensor->buffer = tensor->view_src->buffer;
++    b1b_log_buffer_write("ggml_backend_view_init", tensor, before, tensor->buffer);
+     tensor->data = (char *)tensor->view_src->data + tensor->view_offs;
+     return ggml_backend_buffer_init_tensor(tensor->buffer, tensor);
+ }
+@@ -2059,7 +2139,9 @@ enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct
+         (char *) addr + ggml_backend_buffer_get_alloc_size(buffer, tensor) <=
+         (char *) ggml_backend_buffer_get_base(buffer) + ggml_backend_buffer_get_size(buffer));
+ 
++    const ggml_backend_buffer_t before = tensor->buffer;
+     tensor->buffer = buffer;
++    b1b_log_buffer_write("ggml_backend_tensor_alloc", tensor, before, tensor->buffer);
+     tensor->data = addr;
+     return ggml_backend_buffer_init_tensor(buffer, tensor);
+ }
+@@ -2429,3 +2511,271 @@ ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size)
+     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
+     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+ }
++
++static void ggml_backend_sched_b1b_probe_moe_nodes(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
++    const char * enabled = std::getenv("B1B_SCHEDULER_PROBE");
++    if (!enabled || enabled[0] != '1') return;
++    static uint64_t sequence = 0;
++    for (int i = 0; i < graph->n_nodes; ++i) {
++        struct ggml_tensor * node = graph->nodes[i];
++        if (!node || node->op != GGML_OP_MUL_MAT_ID) continue;
++        const int backend_id = tensor_backend_id(node);
++        ggml_backend_t backend = backend_id >= 0 && backend_id < sched->n_backends ? sched->backends[backend_id] : nullptr;
++        ggml_backend_dev_t backend_dev = backend ? ggml_backend_get_device(backend) : nullptr;
++        const char * classification = backend_dev && ggml_backend_dev_type(backend_dev) == GGML_BACKEND_DEVICE_TYPE_CPU ? "CPU" :
++            backend_dev && ggml_backend_dev_type(backend_dev) == GGML_BACKEND_DEVICE_TYPE_GPU ? "GPU" : "OTHER";
++        struct ggml_tensor * src0 = node->src[0];
++        struct ggml_tensor * src1 = node->src[1];
++        struct ggml_tensor * src2 = node->src[2];
++        auto buffer_name = [](struct ggml_tensor * tensor) -> const char * {
++            if (!tensor) return "<none>";
++            ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++            return buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(buffer)) : "<none>";
++        };
++        auto buffer_device = [](struct ggml_tensor * tensor) -> const char * {
++            if (!tensor) return "<none>";
++            ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
++            if (!buffer) return "<none>";
++            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer));
++            return dev ? ggml_backend_dev_name(dev) : "CPU/NULL";
++        };
++        ggml_expert_storage_info info = {};
++        const bool validated_expert = src0 && ggml_expert_storage_lookup(src0, &info);
++        std::fprintf(stderr, "B1B_SCHED_MUL_MAT_ID sequence=%llu node=%s node_ptr=%p backend_id=%d backend=%s backend_device=%s backend_device_type=%d classification=%s src0=%s src0_type=%s src0_buffer=%s src0_device=%s src0_validated_expert=%d src0_layer=%d src0_kind=%d src1=%s src1_buffer=%s src1_device=%s src2=%s src2_buffer=%s src2_device=%s\n",
++            (unsigned long long) ++sequence, ggml_get_name(node), (void *) node, backend_id,
++            backend ? ggml_backend_name(backend) : "<none>", backend_dev ? ggml_backend_dev_name(backend_dev) : "<none>",
++            backend_dev ? (int) ggml_backend_dev_type(backend_dev) : -1, classification,
++            src0 ? ggml_get_name(src0) : "<none>", src0 ? ggml_type_name(src0->type) : "<none>", buffer_name(src0), buffer_device(src0), validated_expert ? 1 : 0,
++            validated_expert ? info.layer : -1, validated_expert ? info.kind : -1,
++            src1 ? ggml_get_name(src1) : "<none>", buffer_name(src1), buffer_device(src1),
++            src2 ? ggml_get_name(src2) : "<none>", buffer_name(src2), buffer_device(src2));
++    }
++}
++
++// External expert storage is deliberately a separate buffer implementation.
++// Its address range is only a logical placeholder; CPU expert compute must
++// resolve real bytes through ggml_expert_resolve_ptr().
++struct ggml_external_expert_context {
++    void * base = nullptr;
++    size_t reserved = 0;
++};
++
++static void ggml_external_expert_fail(ggml_backend_buffer_t buffer, const char * op, const ggml_tensor * tensor) {
++    GGML_UNUSED(buffer);
++    ggml_expert_external_note_failure(op, tensor);
++    GGML_ABORT("external expert buffer content access is forbidden");
++}
++
++static void ggml_external_expert_free(ggml_backend_buffer_t buffer) {
++    ggml_expert_b1b_buffer_freed((uintptr_t) buffer);
++    auto * ctx = (ggml_external_expert_context *) buffer->context;
++#ifdef _WIN32
++    if (ctx && ctx->base) {
++        VirtualFree(ctx->base, 0, MEM_RELEASE);
++    }
++#else
++    GGML_UNUSED(ctx);
++#endif
++    delete ctx;
++}
++
++static void * ggml_external_expert_base(ggml_backend_buffer_t buffer) {
++    const char * e = std::getenv("B1B_TRACE_BUFFER_BOUNDARY");
++    const bool trace_boundary = e && e[0] == '1';
++    if (trace_boundary) { std::fprintf(stderr, "B1B_EXTERNAL_BASE_ENTER buffer=%p\n", (void *) buffer); std::fflush(stderr); }
++    if (trace_boundary) { std::fprintf(stderr, "B1B_EXTERNAL_CONTEXT_READ_BEGIN buffer=%p\n", (void *) buffer); std::fflush(stderr); }
++    auto * ctx = (ggml_external_expert_context *) buffer->context;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_EXTERNAL_CONTEXT_READ_END context=%p\n", (void *) ctx); std::fflush(stderr); }
++    void * base = ctx->base;
++    if (trace_boundary) { std::fprintf(stderr, "B1B_EXTERNAL_BASE_RETURN base=%p context=%p\n", base, (void *) ctx); std::fflush(stderr); }
++    return base;
++}
++
++static void ggml_external_expert_memset(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t, size_t, size_t) {
++    ggml_external_expert_fail(buffer, "clear", tensor);
++}
++static void ggml_external_expert_set(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void *, size_t, size_t) {
++    ggml_external_expert_fail(buffer, "set", tensor);
++}
++static void ggml_external_expert_get(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void *, size_t, size_t) {
++    ggml_external_expert_fail(buffer, "get", tensor);
++}
++static bool ggml_external_expert_copy(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor *) {
++    ggml_external_expert_fail(buffer, "copy", src);
++    return false;
++}
++static void ggml_external_expert_clear(ggml_backend_buffer_t buffer, uint8_t) {
++    ggml_external_expert_fail(buffer, "clear", nullptr);
++}
++
++static const struct ggml_backend_buffer_i ggml_external_expert_buffer_i = {
++    /* .free_buffer   = */ ggml_external_expert_free,
++    /* .get_base      = */ ggml_external_expert_base,
++    /* .init_tensor   = */ nullptr,
++    /* .memset_tensor = */ ggml_external_expert_memset,
++    /* .set_tensor    = */ ggml_external_expert_set,
++    /* .get_tensor    = */ ggml_external_expert_get,
++    /* .set_tensor_2d = */ nullptr,
++    /* .get_tensor_2d = */ nullptr,
++    /* .cpy_tensor    = */ ggml_external_expert_copy,
++    /* .clear         = */ ggml_external_expert_clear,
++    /* .reset         = */ nullptr,
++};
++
++static const char * ggml_backend_cpu_external_expert_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
++    return "CPU_ExternalExpert";
++
++    GGML_UNUSED(buft);
++}
++
++// External expert storage is reserved address space with no committed pages. It is owned by
++// the CPU backend but is NOT directly readable host memory, so is_host must be false.
++// Reporting host here is what let ggml_backend_sched offload a MoE weight op to CUDA and
++// memcpy the reserved range, which faults once the batch reaches the CUDA offload minimum.
++static bool ggml_backend_cpu_external_expert_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
++    return false;
++
++    GGML_UNUSED(buft);
++}
++
++// These buffers are always created explicitly, never through the graph allocator.
++static ggml_backend_buffer_t ggml_backend_cpu_external_expert_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
++    GGML_UNUSED(buft);
++    GGML_UNUSED(size);
++    return NULL;
++}
++
++ggml_backend_buffer_type_t ggml_backend_cpu_external_expert_buffer_type(void) {
++    static struct ggml_backend_buffer_type ggml_backend_cpu_external_expert_buffer_type = {
++        /* .iface   = */ {
++            /* .get_name         = */ ggml_backend_cpu_external_expert_buffer_type_get_name,
++            /* .alloc_buffer     = */ ggml_backend_cpu_external_expert_buffer_type_alloc_buffer,
++            /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
++            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
++            /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
++            /* .is_host          = */ ggml_backend_cpu_external_expert_buffer_type_is_host,
++        },
++        /* .device  = */ NULL,
++        /* .context = */ NULL,
++    };
++
++    return &ggml_backend_cpu_external_expert_buffer_type;
++}
++
++bool ggml_backend_buft_is_external_expert(ggml_backend_buffer_type_t buft) {
++    return buft == ggml_backend_cpu_external_expert_buffer_type();
++}
++
++ggml_backend_buffer_t ggml_backend_cpu_external_expert_buffer(size_t logical_size,
++                                                                size_t * reserved_size,
++                                                                size_t * committed_size) {
++    if (reserved_size)  *reserved_size = 0;
++    if (committed_size) *committed_size = 0;
++    if (logical_size == 0) {
++        return nullptr;
++    }
++
++#ifdef _WIN32
++    void * base = VirtualAlloc(nullptr, logical_size, MEM_RESERVE, PAGE_NOACCESS);
++    if (!base) {
++        return nullptr;
++    }
++
++    auto * ctx = new ggml_external_expert_context;
++    ctx->base = base;
++    ctx->reserved = logical_size;
++    if (reserved_size) *reserved_size = logical_size;
++    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(ggml_backend_cpu_external_expert_buffer_type(), ggml_external_expert_buffer_i, ctx, logical_size);
++    ggml_expert_b1b_buffer_created((uintptr_t) buffer, 0);
++    return buffer;
++#else
++    GGML_UNUSED(logical_size);
++    return nullptr;
++#endif
++}
++
++bool ggml_backend_buffer_is_external_expert(ggml_backend_buffer_t buffer) {
++    const bool trace_boundary = []() {
++        const char * e = std::getenv("B1B_TRACE_BUFFER_BOUNDARY");
++        return e && e[0] == '1';
++    }();
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_BUFFER_CHECK_ENTER buffer=%p\n", (void *) buffer);
++        std::fflush(stderr);
++    }
++    ggml_expert_b1b_prov(9, (uintptr_t) buffer);
++    ggml_expert_b1b_helper_breadcrumb_ptr(163, 10, (uintptr_t) buffer);
++    ggml_expert_b1b_helper_breadcrumb(162, 10);
++    if (!buffer) {
++        ggml_expert_b1b_helper_breadcrumb(162, 11);
++        if (trace_boundary) {
++            std::fprintf(stderr, "B1B_BUFFER_CHECK_RETURN result=0 buffer=%p\n", (void *) buffer);
++            std::fflush(stderr);
++        }
++        return false;
++    }
++    const uint32_t buffer_state = ggml_expert_b1b_buffer_state((uintptr_t) buffer);
++    ggml_expert_b1b_helper_breadcrumb_ptr(162, 200 + buffer_state, (uintptr_t) buffer);
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_BUFFER_IFACE_READ_BEGIN buffer=%p state=%u\n", (void *) buffer, buffer_state);
++        std::fflush(stderr);
++    }
++    const auto free_buffer = buffer->iface.free_buffer;
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_BUFFER_IFACE_READ_END buffer=%p free_buffer=%p state=%u\n", (void *) buffer, (void *) free_buffer, buffer_state);
++        std::fflush(stderr);
++    }
++    ggml_expert_b1b_helper_breadcrumb(162, 21);
++    const bool result = free_buffer == ggml_external_expert_free;
++    ggml_expert_b1b_helper_breadcrumb(162, 22);
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_BUFFER_CHECK_RETURN result=%d buffer=%p\n", result ? 1 : 0, (void *) buffer);
++        std::fflush(stderr);
++    }
++    return result;
++}
++
++bool ggml_backend_buffer_external_expert_details(ggml_backend_buffer_t buffer,
++                                                  void ** context,
++                                                  void ** base,
++                                                  size_t * reserved) {
++    const bool trace_boundary = []() {
++        const char * e = std::getenv("B1B_TRACE_BUFFER_BOUNDARY");
++        return e && e[0] == '1';
++    }();
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_CALL_EXTERNAL_CHECK_BEGIN buffer=%p\n", (void *) buffer);
++        std::fflush(stderr);
++    }
++    ggml_expert_b1b_prov(7, (uintptr_t) buffer);
++    ggml_expert_b1b_helper_breadcrumb_ptr(161, 10, (uintptr_t) buffer);
++    ggml_expert_b1b_prov(8, (uintptr_t) buffer);
++    const bool is_external = ggml_backend_buffer_is_external_expert(buffer);
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_CALL_EXTERNAL_CHECK_END result=%d buffer=%p\n", is_external ? 1 : 0, (void *) buffer);
++        std::fflush(stderr);
++    }
++    if (!is_external) {
++        ggml_expert_b1b_helper_breadcrumb(161, 11);
++        if (context) *context = nullptr;
++        if (base) *base = nullptr;
++        if (reserved) *reserved = 0;
++        ggml_expert_b1b_helper_breadcrumb(161, 12);
++        return false;
++    }
++    ggml_expert_b1b_helper_breadcrumb(161, 20);
++    if (trace_boundary) {
++        std::fprintf(stderr, "B1B_NEXT_OPERATION_BEGIN operation=read_context buffer=%p\n", (void *) buffer);
++        std::fflush(stderr);
++    }
++    auto * ctx = (ggml_external_expert_context *) buffer->context;
++    ggml_expert_b1b_helper_breadcrumb(161, 21);
++    ggml_expert_b1b_helper_breadcrumb(161, 30);
++    if (context) *context = ctx;
++    ggml_expert_b1b_helper_breadcrumb(161, 31);
++    if (base) *base = ctx ? ctx->base : nullptr;
++    ggml_expert_b1b_helper_breadcrumb(161, 32);
++    if (reserved) *reserved = ctx ? ctx->reserved : 0;
++    ggml_expert_b1b_helper_breadcrumb(161, 40);
++    return true;
++}
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 87ac0a702..cdebe1425 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -5,6 +5,8 @@
+ #include "ggml-backend.h"
+ #include "traits.h"
+ #include "ggml-cpu-impl.h"
++#include "ggml-routing-trace.h"
++#include "ggml-expert-indirection.h"
+ #include "ggml-impl.h"
+ #include "quants.h"
+ #include "ggml-threading.h"
+@@ -34,6 +36,22 @@
+ #include <limits.h>
+ #include <stdarg.h>
+ #include <signal.h>
++
++// A clean B1r4 build must not retain any of the historical wall-clock
++// profilers even if stale build flags still define them.  Those profilers
++// call the clock inside MUL_MAT_ID and materially distort clean inference.
++#if defined(B1R4_COMPILE_OUT_DIAGNOSTICS) && B1R4_COMPILE_OUT_DIAGNOSTICS
++#undef B1S_PROFILE
++#undef B1T_PROFILE
++#undef B1U_PROFILE
++#undef B1W_PROFILE
++#define B1S_PROFILE 0
++#define B1T_PROFILE 0
++#define B1U_PROFILE 0
++#define B1W_PROFILE 0
++#endif
++
++static _Thread_local uint32_t g_mmid_region_sample_seq = 0;
+ #if defined(__gnu_linux__)
+ #include <syscall.h>
+ #endif
+@@ -200,6 +218,16 @@ typedef void * thread_ret_t;
+ 
+ #endif
+ 
++static bool ggml_b1b_pointer_trace_enabled(void) {
++    const char * p = getenv("B1B_TRACE_POINTER_FLOW");
++    return p && p[0] == '1';
++}
++
++static bool ggml_b1b_pointer_trace_take_enabled(void) {
++    static atomic_int count = 0;
++    return atomic_fetch_add_explicit(&count, 1, memory_order_relaxed) < 96;
++}
++
+ typedef pthread_t ggml_thread_t;
+ 
+ #define GGML_THREADPOOL_N_THREADS_MASK (0xffffU)
+@@ -1471,18 +1499,37 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+     const int64_t ir1_start,
+     const int64_t ir1_end,
+     const char * src0_cur,
++    const char * original_plane,
++    const char * cached_plane,
+     const struct mmid_row_mapping * matrix_rows,
+     const size_t row_size,
+     const bool src1_cont,
+-    const void * wdata) {
++    const void * wdata,
++    const bool profile_mmid,
++    const bool external_storage_enabled,
++    const bool pointer_trace_enabled,
++    const int b1w_worker) {
+ 
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+     const enum ggml_type type = src0->type;
++    const bool b1n_profile = external_storage_enabled && ggml_expert_b1n_profile_enabled();
+ 
+     ggml_vec_dot_t    const vec_dot      = type_traits_cpu[type].vec_dot;
+     enum ggml_type    const vec_dot_type = type_traits_cpu[type].vec_dot_type;
+ 
++    // F5: every condition in ggml_expert_validate_cached_row is either invariant in ir0 or
++    // monotonic non-decreasing in it, and the inner loops cover [ir0_start, ir0_end-1]
++    // contiguously with stride one. Validating both endpoints therefore proves the whole
++    // range, so the check moves out of the per-row loop. See F5_VALIDATION_HOIST_PROOF.md.
++    if (cached_plane && ir0_start < ir0_end) {
++        const char * const vec_dot_label = type == GGML_TYPE_Q4_K ? "ggml_vec_dot_q4_K_q8_K" : "unknown";
++        if (!ggml_expert_validate_cached_row(src0, (int) cur_a, original_plane, cached_plane, ir0_start, nb01, nb02, nb01, vec_dot_label) ||
++            !ggml_expert_validate_cached_row(src0, (int) cur_a, original_plane, cached_plane, ir0_end - 1, nb01, nb02, nb01, vec_dot_label)) {
++            GGML_ASSERT(false && "cached expert row bounds failure");
++        }
++    }
++
+     const int64_t blck_0 = 16;
+     const int64_t blck_1 = 16;
+ 
+@@ -1492,6 +1539,8 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ++ir1) {
+                 const int64_t _i12 = ir1; // logical row index for this expert
++                const int b1k_sample = profile_mmid && ggml_expert_b1k_sample();
++                const uint64_t b1k_row_prepare_start = b1k_sample ? ggml_expert_mmid_now_ns() : 0;
+ 
+                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, _i12);
+                 const int id       = row_mapping.i1; // selected expert index
+@@ -1512,12 +1561,59 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
+                     : (i11*nb11 + i12*nb12));
+ 
+                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
++                if (b1k_sample) ggml_expert_b1k_add(0, ggml_expert_mmid_now_ns() - b1k_row_prepare_start);
+ 
++                const uint64_t b1l_inner_row_start = b1k_sample ? ggml_expert_mmid_now_ns() : 0;
++                if (b1k_sample) {
++                    ggml_expert_b1l_branch(0, ggml_expert_external_storage_enabled() != 0);
++                    ggml_expert_b1l_branch(1, cached_plane != NULL);
++                }
+                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+-                    vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
++                    const uint64_t b1n_sample_decision_start = b1n_profile ? ggml_expert_mmid_now_ns() : 0;
++                    const int b1n_sample = b1n_profile && ggml_expert_b1n_sample();
++                    const uint64_t b1n_ir0_start = b1n_sample ? b1n_sample_decision_start : 0;
++                    if (b1n_sample) ggml_expert_b1n_add(3, ggml_expert_mmid_now_ns() - b1n_sample_decision_start);
++                    const uint64_t b1k_external_pointer_start = b1k_sample ? ggml_expert_mmid_now_ns() : 0;
++                    const uint64_t b1l_final_vx_start = b1k_sample ? ggml_expert_mmid_now_ns() : 0;
++                    const uint64_t b1n_pointer_start = b1n_sample ? ggml_expert_mmid_now_ns() : 0;
++                    const char * final_vx = src0_cur + ir0*nb01;
++                    if (b1n_sample) ggml_expert_b1n_add(4, ggml_expert_mmid_now_ns() - b1n_pointer_start);
++                    if (b1k_sample) ggml_expert_b1l_add(1, ggml_expert_mmid_now_ns() - b1l_final_vx_start);
++                    const uint64_t b1l_external_check_start = b1k_sample ? ggml_expert_mmid_now_ns() : 0;
++                    if (external_storage_enabled) {
++                        ggml_expert_note_external_vec_dot(final_vx, src0->data, src0->nb[3]);
++                    }
++                    if (b1k_sample) ggml_expert_b1l_add(2, ggml_expert_mmid_now_ns() - b1l_external_check_start);
++                    if (b1k_sample) ggml_expert_b1k_add(2, ggml_expert_mmid_now_ns() - b1k_external_pointer_start);
++                    const uint64_t b1n_trace_start = b1n_sample ? ggml_expert_mmid_now_ns() : 0;
++                    const int b1n_trace_taken = pointer_trace_enabled && ggml_b1b_pointer_trace_take_enabled();
++                    if (b1n_sample) ggml_expert_b1n_add(2, ggml_expert_mmid_now_ns() - b1n_trace_start);
++                    if (b1n_trace_taken) {
++                        fprintf(stderr, "VEC_DOT_POINTER_FINAL src0=%p src0_data=%p expert=%d cur_a=%lld src0_cur=%p original_plane=%p cached_plane=%p ir0=%lld nb01=%zu nb02=%zu vx=%p\n",
++                            (const void *) src0, src0 ? src0->data : NULL, id, (long long) cur_a,
++                            (const void *) src0_cur, (const void *) original_plane, (const void *) cached_plane,
++                            (long long) ir0, nb01, nb02, (const void *) final_vx);
++                        fflush(stderr);
++                    }
++                    const uint64_t b1n_sampling_start = b1n_sample ? ggml_expert_mmid_now_ns() : 0;
++                    const int mmid_vecdot_sample = profile_mmid && ggml_expert_mmid_vecdot_sample();
++                    if (b1n_sample) ggml_expert_b1n_add(5, ggml_expert_mmid_now_ns() - b1n_sampling_start);
++                    const uint64_t mmid_vecdot_start = mmid_vecdot_sample ? ggml_expert_mmid_now_ns() : 0;
++                    const uint64_t b1n_vecdot_start = b1n_sample ? ggml_expert_mmid_now_ns() : 0;
++                    vec_dot(ne00, &tmp[ir0 - iir0], 0, final_vx, 0, src1_col, 0, 1);
++                    if (mmid_vecdot_sample) ggml_expert_mmid_note_vecdot(ggml_expert_mmid_now_ns() - mmid_vecdot_start);
++                    if (b1n_sample) ggml_expert_b1n_add(6, ggml_expert_mmid_now_ns() - b1n_vecdot_start);
++                    if (b1n_sample) ggml_expert_b1n_add(0, ggml_expert_mmid_now_ns() - b1n_ir0_start);
+                 }
++                if (b1k_sample) ggml_expert_b1l_add(0, ggml_expert_mmid_now_ns() - b1l_inner_row_start);
+ 
++                const uint64_t b1k_loop_start = b1k_sample ? ggml_expert_mmid_now_ns() : 0;
++                const uint64_t mmid_accum_start = ggml_expert_mmid_profile_enabled() ? ggml_expert_mmid_now_ns() : 0;
++                if (b1w_worker >= 0) ggml_expert_b1w_set_state(b1w_worker, GGML_EXPERT_B1W_ACCUMULATION);
+                 memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
++                if (b1w_worker >= 0) ggml_expert_b1w_set_state(b1w_worker, GGML_EXPERT_B1W_MMID_OTHER);
++                if (mmid_accum_start) ggml_expert_mmid_add_region(5, ggml_expert_mmid_now_ns() - mmid_accum_start);
++                if (b1k_sample) ggml_expert_b1k_add(3, ggml_expert_mmid_now_ns() - b1k_loop_start);
+             }
+         }
+     }
+@@ -1543,6 +1639,50 @@ static void ggml_compute_forward_mul_mat_id(
+ 
+     const int ith = params->ith;
+     const int nth = params->nth;
++    const int b1w_profile = ggml_expert_b1w_enabled();
++    if (b1w_profile) {
++        ggml_expert_b1w_start(nth);
++        ggml_expert_b1w_register_worker(ith);
++        ggml_expert_b1w_set_mmid_active(ith, 1);
++        ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_MMID_SETUP);
++    }
++    const bool external_storage_enabled = ggml_expert_external_storage_enabled();
++    // E4: external storage can be limited to a prefix of the MoE layers, so the decision is
++    // per tensor. Layers outside the external set keep the ordinary mmap pointer path.
++    const bool tensor_is_external = ggml_expert_external_is_tensor(src0) != 0;
++    const bool indirection_enabled = ggml_expert_indirection_enabled() && tensor_is_external;
++    const bool b1b_detached_enabled = ggml_expert_b1b_detached_enabled() && tensor_is_external;
++    const bool cached_compute_enabled = ggml_expert_cached_compute_enabled();
++    const bool verify_only_enabled = ggml_expert_verify_only_enabled();
++    const bool cached_bounds_enabled = ggml_expert_cached_bounds_enabled();
++#if B1T_PROFILE
++    const int b1t_profile = ggml_b1t_profile_enabled() && external_storage_enabled && indirection_enabled;
++    const uint64_t b1t_setup_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++    const uint64_t b1t_total_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++#endif
++#if B1S_PROFILE
++    const int b1s_profile = ggml_b1s_profile_enabled();
++    const uint64_t b1s_mmid_start = b1s_profile ? ggml_b1s_mmid_enter(ith) : 0;
++#endif
++    const bool profile_mul_mat_id = ith == 0 && ggml_expert_profile_enabled();
++    const bool pointer_trace_enabled = ggml_b1b_pointer_trace_enabled();
++    if (ggml_expert_mmid_profile_enabled()) ggml_expert_b1m_note_external_storage_eval();
++    const bool profile_mmid = external_storage_enabled && ggml_expert_mmid_profile_enabled();
++    const int64_t profile_mul_mat_id_start_us = profile_mul_mat_id ? ggml_time_us() : 0;
++    const uint64_t mmid_total_start_ns = profile_mmid && ith == 0 ? ggml_expert_mmid_now_ns() : 0;
++    const uint64_t mmid_setup_start_ns = profile_mmid ? ggml_expert_mmid_now_ns() : 0;
++
++    const bool b2d_enabled = ggml_expert_b2d_enabled();
++    int b2d_layer = -1;
++    if (ith == 0 && (ggml_routing_trace_is_enabled() || b2d_enabled)) {
++        const char * name = ggml_get_name(src0);
++        if (ids->ne[1] == 1) {
++            int32_t selected[8];
++            for (int i = 0; i < 8; ++i) selected[i] = *(const int32_t *) ((const char *) ids->data + i*ids->nb[0]);
++            if (ggml_routing_trace_is_enabled()) ggml_routing_trace_record(name, selected, (int) ids->ne[0]);
++            if (b2d_enabled) b2d_layer = ggml_expert_b2d_note_route(src0, selected, (int) ids->ne[0]);
++        }
++    }
+ 
+     const enum ggml_type type = src0->type;
+ 
+@@ -1642,7 +1782,18 @@ static void ggml_compute_forward_mul_mat_id(
+         *current_chunk_ctr = nth;
+     }
+ 
++ #if B1T_PROFILE
++    if (b1t_profile) ggml_b1t_phase_end(ith, 0, b1t_setup_start);
++    const uint64_t b1t_barrier_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++ #endif
++    if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_BARRIER_WAIT);
+     ggml_barrier(params->threadpool);
++    if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_MMID_OTHER);
++ #if B1T_PROFILE
++    if (b1t_profile) ggml_b1t_phase_end(ith, 1, b1t_barrier_start);
++ #endif
++
++    if (profile_mmid) ggml_expert_mmid_add_region(0, ggml_expert_mmid_now_ns() - mmid_setup_start_ns);
+ 
+     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+         const int64_t cne1 = matrix_row_counts[cur_a];
+@@ -1651,9 +1802,64 @@ static void ggml_compute_forward_mul_mat_id(
+             continue;
+         }
+ 
+-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
++        if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_MMID_RANGE_A);
++
++        const bool b1b_detached = b1b_detached_enabled;
++        const bool use_cached_pointer = indirection_enabled && cached_compute_enabled;
++        if (b1b_detached && !use_cached_pointer) {
++            ggml_expert_note_unexpected_mmap_fallback();
++            GGML_ASSERT(false && "B1B detached expert attempted mmap fallback");
++        }
++        const char * src0_original_expert = b1b_detached ? NULL : (const char *) src0->data + cur_a * nb02;
++        const char * src0_cur = src0_original_expert;
++        const char * cached_ptr = NULL;
++        if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_CHUNK_PREPARE);
++#if B1T_PROFILE
++        const uint64_t b1t_rowprep_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++#endif
++        if (pointer_trace_enabled && ggml_b1b_pointer_trace_take_enabled()) {
++            fprintf(stderr, "MULMAT_ID_POINTER_PRE_RESOLVE src0=%p src0_data=%p expert=%lld nb02=%zu logical=%p indirection=%d cache_compute=%d detached=%d\n",
++                (const void *) src0, src0 ? src0->data : NULL, (long long) cur_a, nb02,
++                (const void *) src0_original_expert, indirection_enabled,
++                cached_compute_enabled, b1b_detached);
++            fflush(stderr);
++        }
++        if (indirection_enabled) {
++#if B1T_PROFILE
++            if (b1t_profile) ggml_b1t_phase_end(ith, 2, b1t_rowprep_start);
++            const uint64_t b1t_resolver_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++#endif
++#if B1S_PROFILE
++            const uint64_t b1s_resolver_start = b1s_profile ? ggml_b1s_region_begin() : 0;
++#endif
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_RESOLVER);
++            cached_ptr = ggml_expert_resolve_ptr(src0, cur_a, nb02);
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_MMID_RANGE_B);
++#if B1T_PROFILE
++            if (b1t_profile) ggml_b1t_phase_end(ith, 3, b1t_resolver_start);
++#endif
++#if B1S_PROFILE
++            if (b1s_profile) ggml_b1s_region_end(ith, 0, b1s_resolver_start);
++#endif
++            GGML_ASSERT(cached_ptr != NULL);
++            src0_cur = (verify_only_enabled || !cached_compute_enabled) ? src0_original_expert : cached_ptr;
++            if (pointer_trace_enabled && ggml_b1b_pointer_trace_take_enabled()) {
++                fprintf(stderr, "MULMAT_ID_POINTER_POST_RESOLVE src0=%p expert=%lld resolver_out=%p cached_ptr=%p selected=%p original=%p verify_only=%d cache_compute=%d\n",
++                    (const void *) src0, (long long) cur_a, (const void *) cached_ptr, (const void *) cached_ptr,
++                    (const void *) src0_cur, (const void *) src0_original_expert,
++                    verify_only_enabled, cached_compute_enabled);
++                fflush(stderr);
++            }
++            if (src0_cur == cached_ptr) { ggml_expert_note_cached_pointer_use(); } else { ggml_expert_note_original_pointer_use(); }
++        } else if (!b1b_detached) {
++            ggml_expert_note_original_pointer_use();
++        }
++        const uint64_t mmid_pointer_setup_start_ns = profile_mmid ? ggml_expert_mmid_now_ns() : 0;
+         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
++#if B1T_PROFILE
++        uint64_t b1t_chunkprep_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++#endif
+ 
+         const int64_t nr0 = ne01;
+         const int64_t nr1 = cne1;
+@@ -1677,9 +1883,12 @@ static void ggml_compute_forward_mul_mat_id(
+         const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
+         const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
+ 
++        if (profile_mmid) ggml_expert_mmid_add_region(2, ggml_expert_mmid_now_ns() - mmid_pointer_setup_start_ns);
++
+         int current_chunk = ith;
+ 
+         atomic_int * current_chunk_ctr = (atomic_int *)(atomic_current_chunk + cur_a);
++        if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_CHUNK_ACQUIRE);
+ 
+         while (current_chunk < nchunk0 * nchunk1) {
+             const int64_t ith0 = current_chunk % nchunk0;
+@@ -1691,18 +1900,87 @@ static void ggml_compute_forward_mul_mat_id(
+             const int64_t ir1_start = dr1 * ith1;
+             const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
+ 
++#if B1S_PROFILE
++            const uint64_t b1s_compute_start = b1s_profile ? ggml_b1s_region_begin() : 0;
++#endif
++            #if B1T_PROFILE
++            const uint64_t b1t_compute_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++            if (b1t_profile) ggml_b1t_phase_end(ith, 4, b1t_chunkprep_start);
++            #endif
++            const uint64_t mmid_compute_start_ns = profile_mmid ? ggml_expert_mmid_now_ns() : 0;
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_EXTERNAL_COMPUTE);
++            if (cached_ptr && current_chunk == 0 && b2d_enabled && b2d_layer >= 0) ggml_expert_b2d_note_first_use(b2d_layer, cur_a);
+             ggml_compute_forward_mul_mat_id_one_chunk(
+                 dst, src0, src1, ids, cur_a,
+                 ir0_start, ir0_end, ir1_start, ir1_end,
+-                src0_cur, matrix_rows, row_size, src1_cont, wdata
++                src0_cur, src0_original_expert,
++                (cached_ptr && (cached_bounds_enabled || cached_compute_enabled)) ? cached_ptr : NULL,
++                matrix_rows, row_size, src1_cont, wdata, profile_mmid, external_storage_enabled, pointer_trace_enabled
++                , ith
+             );
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_MMID_RANGE_C);
++#if B1T_PROFILE
++            if (b1t_profile) ggml_b1t_phase_end(ith, 5, b1t_compute_start);
++#endif
++#if B1S_PROFILE
++            if (b1s_profile) ggml_b1s_region_end(ith, 1, b1s_compute_start);
++#endif
++            if (profile_mmid) ggml_expert_mmid_add_region(4, ggml_expert_mmid_now_ns() - mmid_compute_start_ns);
+ 
+             if (nth >= nchunk0 * nchunk1) {
+                 break;
+             }
+ 
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_CHUNK_COMPLETE);
++
++            #if B1T_PROFILE
++            const uint64_t b1t_dispatch_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++            #endif
++            const uint64_t mmid_dispatch_start_ns = profile_mmid ? ggml_expert_mmid_now_ns() : 0;
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_CHUNK_ACQUIRE);
+             current_chunk = atomic_fetch_add_explicit(current_chunk_ctr, 1, memory_order_relaxed);
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_CHUNK_PREPARE);
++            if (profile_mmid) ggml_expert_mmid_add_region(3, ggml_expert_mmid_now_ns() - mmid_dispatch_start_ns);
++            #if B1T_PROFILE
++            if (b1t_profile) ggml_b1t_phase_end(ith, 4, b1t_dispatch_start);
++            if (b1t_profile) b1t_chunkprep_start = ggml_b1t_phase_begin();
++            #endif
+         }
++        if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_MMID_RANGE_D);
++        if (indirection_enabled) {
++#if B1T_PROFILE
++            const uint64_t b1t_unpin_start = b1t_profile ? ggml_b1t_phase_begin() : 0;
++#endif
++#if B1S_PROFILE
++            const uint64_t b1s_unpin_start = b1s_profile ? ggml_b1s_region_begin() : 0;
++#endif
++            const int mmid_unpin_sample = profile_mmid && ((++g_mmid_region_sample_seq & 63u) == 0);
++            const uint64_t mmid_unpin_start_ns = mmid_unpin_sample ? ggml_expert_mmid_now_ns() : 0;
++            if (b1w_profile) ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_UNPIN_RELEASE);
++            ggml_expert_cache_unpin(src0, cur_a);
++#if B1T_PROFILE
++            if (b1t_profile) ggml_b1t_phase_end(ith, 6, b1t_unpin_start);
++#endif
++            if (mmid_unpin_sample) ggml_expert_mmid_add_region(6, (ggml_expert_mmid_now_ns() - mmid_unpin_start_ns) * 64);
++#if B1S_PROFILE
++            if (b1s_profile) ggml_b1s_region_end(ith, 2, b1s_unpin_start);
++#endif
++        }
++    }
++    if (profile_mul_mat_id) {
++        const int64_t elapsed_us = ggml_time_us() - profile_mul_mat_id_start_us;
++        ggml_expert_note_mul_mat_id_time((uint64_t) (elapsed_us > 0 ? elapsed_us : 0));
++    }
++    if (profile_mmid && ith == 0) ggml_expert_mmid_note_call(ggml_expert_mmid_now_ns() - mmid_total_start_ns);
++#if B1S_PROFILE
++    if (b1s_profile) ggml_b1s_mmid_exit(ith, b1s_mmid_start);
++#endif
++#if B1T_PROFILE
++    if (b1t_profile) ggml_b1t_total_end(ith, b1t_total_start);
++#endif
++    if (b1w_profile) {
++        ggml_expert_b1w_set_mmid_active(ith, 0);
++        ggml_expert_b1w_set_state(ith, GGML_EXPERT_B1W_OUTSIDE_MMID);
+     }
+ }
+ 
+@@ -3065,6 +3343,10 @@ static int ggml_cpu_try_fuse_ops(
+ static thread_ret_t ggml_graph_compute_thread(void * data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool    * tp    = state->threadpool;
++    if (ggml_expert_b1w_enabled()) {
++        ggml_expert_b1w_register_worker(state->ith);
++        ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_OUTSIDE_MMID);
++    }
+ 
+     const struct ggml_cgraph * cgraph = tp->cgraph;
+     const struct ggml_cplan  * cplan  = tp->cplan;
+@@ -3187,18 +3469,24 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state *
+ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state * state) {
+     struct ggml_threadpool * threadpool = state->threadpool;
+ 
++    if (ggml_expert_b1w_enabled()) ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_TASK_ACQUIRE);
++    if (ggml_expert_b1w_enabled()) ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_SCHEDULER);
++
+     if (ggml_graph_compute_poll_for_work(state)) {
+         ggml_graph_compute_thread_sync(state);
+         return state->pending;
+     }
+ 
++    if (ggml_expert_b1w_enabled()) ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_LOCK_WAIT);
+     ggml_mutex_lock_shared(&threadpool->mutex);
+     while (!ggml_graph_compute_thread_ready(state)) {
+         // No new work. Wait for the signal.
+         GGML_PRINT_DEBUG("thread #%d waiting for work (sleeping)\n", state->ith);
++        if (ggml_expert_b1w_enabled()) ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_WAIT_IDLE);
+         ggml_cond_wait(&threadpool->cond, &threadpool->mutex);
+     }
+     ggml_mutex_unlock_shared(&threadpool->mutex);
++    if (ggml_expert_b1w_enabled()) ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_TASK_ACQUIRE);
+ 
+     return state->pending;
+ }
+@@ -3206,6 +3494,10 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
+ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
+     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+     struct ggml_threadpool * threadpool = state->threadpool;
++    if (ggml_expert_b1w_enabled()) {
++        ggml_expert_b1w_register_worker(state->ith);
++        ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_SCHEDULER);
++    }
+ 
+     ggml_thread_apply_priority(threadpool->prio);
+     if (ggml_thread_cpumask_is_valid(state->cpumask)) {
+@@ -3230,11 +3522,13 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
+         // Check if there is new work
+         // The main thread is the only one that can dispatch new work
+ 
++        if (ggml_expert_b1w_enabled()) ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_SCHEDULER);
+         ggml_graph_compute_check_for_work(state);
+         if (state->pending) {
+             state->pending = false;
+             ggml_graph_compute_thread(state);
+         }
++        if (ggml_expert_b1w_enabled()) ggml_expert_b1w_set_state(state->ith, GGML_EXPERT_B1W_SCHEDULER);
+     }
+ 
+     return (thread_ret_t) 0;
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.cpp b/ggml/src/ggml-cpu/ggml-cpu.cpp
+index 8cece71f1..271092fc8 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.cpp
++++ b/ggml/src/ggml-cpu/ggml-cpu.cpp
+@@ -73,6 +73,14 @@ std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_type
+     return bufts;
+ }
+ 
++ggml_backend_buffer_type_t ggml_backend_cpu_repack_buffer_type_public(void) {
++#ifdef GGML_USE_CPU_REPACK
++    return ggml_backend_cpu_repack_buffer_type();
++#else
++    return nullptr;
++#endif
++}
++
+ static ggml_backend_buffer_type_t * ggml_backend_cpu_device_get_extra_buffers_type(ggml_backend_dev_t device) {
+     static std::vector<ggml_backend_buffer_type_t> extra_bufts = [] {
+         std::vector<ggml_backend_buffer_type_t> bufts = ggml_backend_cpu_get_extra_buffer_types();
+@@ -480,7 +488,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+ }
+ 
+ static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+-    return ggml_backend_buft_is_host(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
++    // external expert storage is CPU owned but not host readable, so claim it explicitly
++    return ggml_backend_buft_is_host(buft) || ggml_backend_buft_is_external_expert(buft) || ggml_backend_cpu_is_extra_buffer_type(buft);
+     GGML_UNUSED(dev);
+ }
+ 
+diff --git a/ggml/src/ggml-cpu/repack.cpp b/ggml/src/ggml-cpu/repack.cpp
+index 9689ca3ce..cd781be9a 100644
+--- a/ggml/src/ggml-cpu/repack.cpp
++++ b/ggml/src/ggml-cpu/repack.cpp
+@@ -6,6 +6,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-cpu.h"
+ #include "ggml-cpu-impl.h"
++#include "ggml-routing-trace.h"
+ #include "simd-mappings.h"
+ #include "traits.h"
+ 
+@@ -4384,6 +4385,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+     }
+ 
+     void forward_mul_mat_id(ggml_compute_params * params, ggml_tensor * op) {
++        if (params->ith == 0 && ggml_routing_trace_is_enabled()) {
++            const ggml_tensor * ids = op->src[2];
++            if (ids->ne[0] == 8) {
++                int32_t selected[8];
++                for (int i = 0; i < 8; ++i) selected[i] = *(const int32_t *) ((const char *) ids->data + i*ids->nb[0]);
++                ggml_routing_trace_record(ggml_get_name(op->src[0]), selected, (int) ids->ne[0]);
++            }
++        }
+         const ggml_tensor * src0 = op->src[0];
+         const ggml_tensor * src1 = op->src[1];
+         const ggml_tensor * ids  = op->src[2];
+@@ -4476,8 +4485,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                 continue;
+             }
+ 
+-            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
+-
+             //const int64_t nr0 = ne01; // src0 rows
+             const int64_t nr1 = cne1; // src1 rows
+ 
+@@ -4495,6 +4502,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
+                 return;
+             }
+ 
++            const auto * src0_cur = (const char *) src0->data + cur_a*nb02;
++
+             for (int ir1 = 0; ir1 < nr1; ir1++) {
+                 struct mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1);
+ 
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 1a60fec79..a39c4fe30 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -37,6 +37,8 @@
+ #include <syscall.h>
+ #endif
+ 
++extern void ggml_expert_storage_context_invalidated(const void * mem_buffer, size_t mem_size, const char * reason);
++
+ #if defined(__APPLE__)
+ #include <unistd.h>
+ #include <mach/mach.h>
+@@ -983,6 +985,22 @@ struct ggml_context {
+     struct ggml_object * objects_end;
+ };
+ 
++static void * g_b1b_target_tensor = NULL;
++
++static bool b1b_lifetime_trace_enabled(void) {
++    const char * e = getenv("B1B_TRACE_TENSOR_LIFETIME");
++    return e && e[0] == '1';
++}
++
++static bool b1b_range_contains(uintptr_t start, size_t size, uintptr_t point) {
++    return size <= UINTPTR_MAX - start && point >= start && point < start + size;
++}
++
++static bool b1b_context_contains_target(const struct ggml_context * ctx) {
++    if (!ctx || !ctx->mem_buffer || !g_b1b_target_tensor) return false;
++    return b1b_range_contains((uintptr_t) ctx->mem_buffer, ctx->mem_size, (uintptr_t) g_b1b_target_tensor);
++}
++
+ //
+ // data types
+ //
+@@ -1654,6 +1672,14 @@ void ggml_reset(struct ggml_context * ctx) {
+         return;
+     }
+ 
++    if (b1b_lifetime_trace_enabled() && b1b_context_contains_target(ctx)) {
++        fprintf(stderr, "B1B_CONTEXT_RESET ctx=%p mem_buffer=%p mem_size=%zu target=%p used=%zu no_alloc=%d\n",
++            (void *) ctx, ctx->mem_buffer, ctx->mem_size, g_b1b_target_tensor,
++            ggml_used_mem(ctx), ctx->no_alloc ? 1 : 0);
++        fflush(stderr);
++    }
++    ggml_expert_storage_context_invalidated(ctx->mem_buffer, ctx->mem_size, "reset");
++
+     ctx->n_objects     = 0;
+     ctx->objects_begin = NULL;
+     ctx->objects_end   = NULL;
+@@ -1664,6 +1690,14 @@ void ggml_free(struct ggml_context * ctx) {
+         return;
+     }
+ 
++    if (b1b_lifetime_trace_enabled() && b1b_context_contains_target(ctx)) {
++        fprintf(stderr, "B1B_CONTEXT_FREE ctx=%p mem_buffer=%p mem_size=%zu target=%p used=%zu no_alloc=%d owned=%d\n",
++            (void *) ctx, ctx->mem_buffer, ctx->mem_size, g_b1b_target_tensor,
++            ggml_used_mem(ctx), ctx->no_alloc ? 1 : 0, ctx->mem_buffer_owned ? 1 : 0);
++        fflush(stderr);
++    }
++    ggml_expert_storage_context_invalidated(ctx->mem_buffer, ctx->mem_size, "free");
++
+     if (ctx->mem_buffer_owned) {
+         ggml_aligned_free(ctx->mem_buffer, ctx->mem_size);
+     }
+@@ -1757,6 +1791,21 @@ static struct ggml_object * ggml_new_object(struct ggml_context * ctx, enum ggml
+ 
+     ctx->objects_end = obj_new;
+ 
++    if (b1b_lifetime_trace_enabled() && g_b1b_target_tensor) {
++        const uintptr_t alloc_start = (uintptr_t) (mem_buffer + obj_new->offs);
++        const size_t alloc_size = obj_new->size;
++        const uintptr_t target = (uintptr_t) g_b1b_target_tensor;
++        if (b1b_range_contains(alloc_start, alloc_size, target) ||
++            b1b_range_contains(target, sizeof(struct ggml_tensor), alloc_start)) {
++            fprintf(stderr,
++                "B1B_TARGET_STORAGE_REUSED ctx=%p mem_buffer=%p mem_size=%zu type=%d object=%p object_start=%p object_size=%zu target=%p target_end=%p\n",
++                (void *) ctx, ctx->mem_buffer, ctx->mem_size, (int) type, (void *) obj_new,
++                (void *) alloc_start, alloc_size, g_b1b_target_tensor,
++                (void *) (target + sizeof(struct ggml_tensor)));
++            fflush(stderr);
++        }
++    }
++
+     //printf("%s: inserted new object at %zu, size = %zu\n", __func__, cur_end, obj_new->size);
+ 
+     return obj_new;
+@@ -1948,6 +1997,13 @@ struct ggml_tensor * ggml_set_name(struct ggml_tensor * tensor, const char * nam
+         tensor->name[i] = name[i];
+     }
+     tensor->name[i] = '\0';
++    if (b1b_lifetime_trace_enabled() && strcmp(name, "blk.0.ffn_gate_exps.weight") == 0) {
++        g_b1b_target_tensor = tensor;
++        fprintf(stderr, "B1B_TARGET_CREATED tensor=%p tensor_end=%p sizeof_tensor=%zu name=%s\n",
++            (void *) tensor, (void *) ((uintptr_t) tensor + sizeof(struct ggml_tensor)),
++            sizeof(struct ggml_tensor), tensor->name);
++        fflush(stderr);
++    }
+     return tensor;
+ }
+ 
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 52f8d5367..f11470c70 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "ggml-routing-trace.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -1323,6 +1324,9 @@ bool llama_context::set_adapter_cvec(
+ }
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    // Decode batches are single-token execution units in this server path. The
++    // boundary is controlled here, never inferred by the CPU kernel.
++    ggml_routing_trace_set_enabled((gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER || gtype == LLM_GRAPH_TYPE_DECODER_MTP) && ubatch.n_tokens == 1);
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index ed572da7f..4a34ec8d0 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -423,6 +423,14 @@ int llama_file::file_id() const {
+ #endif
+ }
+ 
++void * llama_file::os_handle() const {
++#ifdef _WIN32
++    return (void *) _get_osfhandle(_fileno(pimpl->fp));
++#else
++    return (void *)(intptr_t) file_id();
++#endif
++}
++
+ void llama_file::seek(size_t offset, int whence) const { pimpl->seek(offset, whence); }
+ void llama_file::read_raw(void * ptr, size_t len) { pimpl->read_raw(ptr, len); }
+ #ifdef _WIN32
+diff --git a/src/llama-mmap.h b/src/llama-mmap.h
+index b7d5c61e9..4f7497c94 100644
+--- a/src/llama-mmap.h
++++ b/src/llama-mmap.h
+@@ -22,6 +22,7 @@ struct llama_file {
+     size_t size() const;
+ 
+     int file_id() const; // fileno overload
++    void * os_handle() const;
+ 
+     void seek(size_t offset, int whence) const;
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 9b22cb05f..a69d17f17 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1,4 +1,6 @@
+ #include "llama-model-loader.h"
++#include "ggml-expert-indirection.h"
++#include "ggml-cpu.h"
+ 
+ #include "ggml-alloc.h"
+ #include "ggml.h"
+@@ -10,9 +12,16 @@
+ #include <array>
+ #include <cinttypes>
+ #include <cstdint>
++#include <climits>
+ #include <cstring>
+ #include <future>
+ #include <regex>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#endif
+ 
+ static const size_t kiB = 1024;
+ static const size_t MiB = 1024*kiB;
+@@ -705,6 +714,72 @@ llama_model_loader::llama_model_loader(
+     n_kv      = gguf_get_n_kv(metadata);
+     n_tensors = weights_map.size();
+ 
++    // Development-only storage seam for the raw CPU MoE expert prototype.
++    // This uses the same tensor_buft_overrides array that select_weight_buft()
++    // uses for -ncmoe, so the registry does not infer CPU placement from a
++    // device or buffer name.
++    const auto is_cpu_moe_override = [this](const char * tensor_name) {
++        if (!tensor_name || !tensor_buft_overrides) {
++            return false;
++        }
++        for (const auto * override = tensor_buft_overrides; override->pattern != nullptr; ++override) {
++            if (override->buft != ggml_backend_cpu_buffer_type() &&
++                override->buft != ggml_backend_cpu_repack_buffer_type_public()) {
++                continue;
++            }
++            if (std::regex_search(std::string(tensor_name), std::regex(override->pattern))) {
++                return true;
++            }
++        }
++        return false;
++    };
++    // E4: optional cap on how many MoE layers use external storage. Layers at or above the
++    // cap keep the ordinary CPU mmap path, which trades resident memory for no bundle copy.
++    // Unset means every CPU MoE layer is external, the default behaviour.
++    int external_layer_limit = INT_MAX;
++    if (const char * lim = std::getenv("B1B_EXTERNAL_MAX_LAYERS")) {
++        const int parsed = std::atoi(lim);
++        if (parsed >= 0) {
++            external_layer_limit = parsed;
++        }
++    }
++    for (const auto & it : weights_map) {
++        const llama_tensor_weight & w = it.second;
++        ggml_tensor * t = w.tensor;
++        const char * name = ggml_get_name(t);
++        int layer = -1;
++        char kind = 0;
++        char extra = 0;
++        if (sscanf(name, "blk.%d.ffn_gate_exps.weight%c", &layer, &extra) == 1 && std::string(name) == format("blk.%d.ffn_gate_exps.weight", layer)) kind = 0;
++        else if (sscanf(name, "blk.%d.ffn_up_exps.weight%c", &layer, &extra) == 1 && std::string(name) == format("blk.%d.ffn_up_exps.weight", layer)) kind = 1;
++        else if (sscanf(name, "blk.%d.ffn_down_exps.weight%c", &layer, &extra) == 1 && std::string(name) == format("blk.%d.ffn_down_exps.weight", layer)) kind = 2;
++        if (layer >= 0 && layer < external_layer_limit && (kind == 0 || kind == 1 || kind == 2) && is_cpu_moe_override(name)) {
++            const uint32_t n_experts = t->ne[2];
++            const uint64_t plane_stride = t->nb[2];
++            const uint64_t plane_size = n_experts ? ggml_nbytes(t) / n_experts : 0;
++            ggml_expert_storage_info info = {};
++            info.tensor = t;
++            info.name = name;
++            info.layer = layer;
++            info.kind = kind;
++            info.file_index = w.idx;
++            HANDLE owned = INVALID_HANDLE_VALUE;
++            DuplicateHandle(GetCurrentProcess(), (HANDLE) files.at(w.idx)->os_handle(), GetCurrentProcess(), &owned, 0, FALSE, DUPLICATE_SAME_ACCESS);
++            info.os_handle = (uint64_t)(uintptr_t) owned;
++            info.absolute_offset = w.offs;
++            info.plane_stride = plane_stride;
++            info.plane_size = plane_size;
++            info.tensor_size = ggml_nbytes(t);
++            info.ggml_type = (int) t->type;
++            info.n_experts = n_experts;
++            info.cpu_override = 1;
++            ggml_expert_storage_register(&info);
++        }
++    }
++    if (!ggml_expert_storage_registry_validate()) {
++        throw std::runtime_error("invalid CPU MoE expert storage registry");
++    }
++
+     fver = (enum llama_fver) gguf_get_version(metadata);
+ 
+     LLAMA_LOG_INFO("%s: loaded meta data with %d key-value pairs and %d tensors from %s (version %s)\n",
+@@ -1553,6 +1628,13 @@ bool llama_model_loader::load_all_data(
+ 
+         size_t n_size = ggml_nbytes(cur);
+ 
++        if (cur->buffer && ggml_backend_buffer_is_external_expert(cur->buffer)) {
++            // Metadata and direct-I/O registry are already available.  Do not
++            // bind, copy, validate, or upload this tensor from the GGUF mmap.
++            size_done += n_size;
++            continue;
++        }
++
+         if (use_mmap) {
+             const auto & mapping = mappings.at(weight->idx);
+             ggml_backend_buffer_t buf_mmap = nullptr;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 3759c8625..fc2be947a 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -8,6 +8,14 @@
+ #include "llama-cparams.h"
+ #include "llama-model-loader.h"
+ 
++static bool b1b_lookup_logging_on_model() {
++    static const bool enabled = []() {
++        const char * p = std::getenv("B1B_LOOKUP_LOGGING");
++        return p && p[0] == '1';
++    }();
++    return enabled;
++}
++
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+ #include "llama-kv-cache-dsa.h"
+@@ -22,6 +30,8 @@
+ 
+ #include "ggml.h"
+ #include "ggml-cpp.h"
++#include "ggml-expert-indirection.h"
++
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -33,6 +43,110 @@
+ #include <map>
+ #include <numeric>
+ #include <regex>
++#include <fstream>
++#ifdef _WIN32
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++#include <windows.h>
++#include <process.h>
++#endif
++
++static bool llama_export_expert_ranges(const llama_model_loader & ml,
++                                       const std::vector<std::pair<std::string, ggml_tensor *>> & tensors) {
++    std::fprintf(stderr, "B1B pid=%lu tid=%lu EXPERT_RANGE_EXPORT_BEGIN\n",
++#ifdef _WIN32
++        (unsigned long) GetCurrentProcessId(), (unsigned long) GetCurrentThreadId()
++#else
++        0ul, 0ul
++#endif
++    );
++    std::fflush(stderr);
++    const char * path = std::getenv("LLAMA_EXPERT_RANGE_OUT");
++    if (!path || !*path) {
++        std::fprintf(stderr, "B1B pid=%lu tid=%lu EXPERT_RANGE_EXPORT_END skipped=1\n",
++#ifdef _WIN32
++            (unsigned long) GetCurrentProcessId(), (unsigned long) GetCurrentThreadId()
++#else
++            0ul, 0ul
++#endif
++        );
++        std::fflush(stderr);
++        return true;
++    }
++    std::ofstream out(path, std::ios::trunc);
++    if (!out) { LLAMA_LOG_ERROR("cannot open expert range manifest: %s\n", path); return false; }
++    out << "pid,layer,kind,expert_id,tensor_base_address,plane_base_address,plane_size_bytes,plane_stride_bytes,tensor_size_bytes,gguf_tensor_offset,gguf_plane_offset,tensor_name,type,ne0,ne1,ne2,ne3,nb0,nb1,nb2,nb3,expert_dimension,expert_stride,direct_read_size\n";
++    const int pid =
++#ifdef _WIN32
++        _getpid();
++#else
++        getpid();
++#endif
++    int rows = 0;
++    for (const auto & item : tensors) {
++        const std::string & name = item.first;
++        ggml_tensor * tensor = item.second;
++        int layer = -1; const char * kind = nullptr;
++        if (sscanf(name.c_str(), "blk.%d.ffn_gate_exps.weight", &layer) == 1 && name == format("blk.%d.ffn_gate_exps.weight", layer)) kind = "gate";
++        else if (sscanf(name.c_str(), "blk.%d.ffn_up_exps.weight", &layer) == 1 && name == format("blk.%d.ffn_up_exps.weight", layer)) kind = "up";
++        else if (sscanf(name.c_str(), "blk.%d.ffn_down_exps.weight", &layer) == 1 && name == format("blk.%d.ffn_down_exps.weight", layer)) kind = "down";
++        if (!kind || layer < 0 || layer >= 30 || !tensor || !tensor->data) continue;
++        const llama_model_loader::llama_tensor_weight * w = ml.get_weight(name.c_str());
++        if (!w || tensor->ne[2] != 256 || tensor->nb[2] == 0) { LLAMA_LOG_ERROR("invalid expert metadata: %s\n", name.c_str()); return false; }
++        const uint64_t tensor_size = ggml_nbytes(tensor), stride = tensor->nb[2], plane = tensor_size / 256;
++        const uintptr_t base = (uintptr_t) tensor->data;
++        for (int e = 0; e < 256; ++e) {
++            const uint64_t off = (uint64_t)e * stride;
++            if (off > tensor_size || plane > tensor_size - off || w->offs > UINT64_MAX - off) return false;
++            const uintptr_t addr = base + (uintptr_t)off;
++            if (addr < base || addr + plane < addr) return false;
++            out << pid << ',' << layer << ',' << kind << ',' << e << ",0x" << std::hex << base << ",0x" << addr << std::dec << ',' << plane << ',' << stride << ',' << tensor_size << ',' << w->offs << ',' << (w->offs + off) << ',' << name << ',' << (int) tensor->type;
++            for (int i = 0; i < GGML_MAX_DIMS; ++i) out << ',' << tensor->ne[i];
++            for (int i = 0; i < GGML_MAX_DIMS; ++i) out << ',' << tensor->nb[i];
++            out << ',' << 2 << ',' << stride << ',' << plane << '\n';
++            ++rows;
++        }
++    }
++    out.flush();
++    LLAMA_LOG_INFO("expert range manifest exported: %d rows\n", rows);
++    const bool result = rows == 23040;
++    std::fprintf(stderr, "B1B pid=%lu tid=%lu EXPERT_RANGE_EXPORT_END rows=%d result=%d\n",
++#ifdef _WIN32
++        (unsigned long) GetCurrentProcessId(), (unsigned long) GetCurrentThreadId(),
++#else
++        0ul, 0ul,
++#endif
++        rows, result ? 1 : 0);
++    std::fflush(stderr);
++    return result;
++}
++
++static void llama_validate_expert_storage(const llama_model_loader & ml) {
++    const char * out_path = std::getenv("LLAMA_STORAGE_VALIDATOR_OUT");
++    if (!out_path) return;
++    std::ofstream out(out_path, std::ios::trunc);
++    int registered = 0, valid = 0, invalid = 0, pass = 0, fail = 0;
++    const int samples[][2] = {{0,0},{0,255},{15,127},{29,0},{29,255}};
++    for (const auto & it : ml.weights_map) {
++        const auto & w = it.second; const char * n = ggml_get_name(w.tensor); int layer = -1; char extra = 0; int kind = -1;
++        if (sscanf(n, "blk.%d.ffn_gate_exps.weight%c", &layer, &extra) == 1 && std::string(n) == format("blk.%d.ffn_gate_exps.weight", layer)) kind = 0;
++        else if (sscanf(n, "blk.%d.ffn_up_exps.weight%c", &layer, &extra) == 1 && std::string(n) == format("blk.%d.ffn_up_exps.weight", layer)) kind = 1;
++        else if (sscanf(n, "blk.%d.ffn_down_exps.weight%c", &layer, &extra) == 1 && std::string(n) == format("blk.%d.ffn_down_exps.weight", layer)) kind = 2;
++        if (layer < 0 || layer >= 30 || kind < 0) continue;
++        ++registered; const uint64_t count = w.tensor->ne[2], stride = w.tensor->nb[2], size = count ? ggml_nbytes(w.tensor)/count : 0;
++        const bool range = count > 0 && size > 0 && stride >= size && w.offs + (count-1)*stride + size <= w.offs + ggml_nbytes(w.tensor) && w.offs + (count-1)*stride + size <= ml.files.at(w.idx)->size();
++        if (range) ++valid; else { ++invalid; out << "RANGE_FAIL," << n << "\n"; continue; }
++        for (const auto & s : samples) if (s[0] == layer) {
++            std::vector<uint8_t> direct(size); const uint8_t * mapped = (const uint8_t *)ml.mappings.at(w.idx)->addr() + w.offs + s[1]*stride; bool ok = false;
++#ifdef _WIN32
++            HANDLE dup = INVALID_HANDLE_VALUE; ok = DuplicateHandle(GetCurrentProcess(), (HANDLE)ml.files.at(w.idx)->os_handle(), GetCurrentProcess(), &dup, 0, FALSE, DUPLICATE_SAME_ACCESS); LARGE_INTEGER pos; pos.QuadPart = (LONGLONG)(w.offs + s[1]*stride); if (ok) ok = SetFilePointerEx(dup, pos, nullptr, FILE_BEGIN); DWORD got = 0; if (ok) ok = ReadFile(dup, direct.data(), (DWORD)size, &got, nullptr) && got == size; if (dup != INVALID_HANDLE_VALUE) CloseHandle(dup);
++#endif
++            const bool equal = ok && std::memcmp(direct.data(), mapped, size) == 0; if (equal) ++pass; else ++fail; out << "L" << layer << ",E" << s[1] << "," << kind << "," << (equal ? "PASS" : "FAIL") << "," << size << "\n"; out.flush();
++        }
++    }
++    out << "REGISTERED=" << registered << "\nVALID_RANGES=" << valid << "\nINVALID_RANGES=" << invalid << "\nPASS=" << pass << "\nFAIL=" << fail << "\nVALIDATION_COMPLETE=1\n"; out.flush();
++}
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
+@@ -1277,7 +1391,62 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+     vocab.load(ml, kv);
+ }
+ 
++static void b1b_log_gate_expert_identity(const char * stage, const ggml_tensor * tensor, int registry_result = -1) {
++    if (!tensor || std::strcmp(ggml_get_name(tensor), "blk.0.ffn_gate_exps.weight") != 0) {
++        return;
++    }
++    ggml_backend_buffer_t buffer = tensor->buffer;
++    void * external_context = nullptr;
++    void * external_base = nullptr;
++    size_t external_reserved = 0;
++    const bool external = ggml_backend_buffer_external_expert_details(buffer, &external_context, &external_base, &external_reserved);
++    const size_t buffer_size = buffer ? ggml_backend_buffer_get_size(buffer) : 0;
++    void * buffer_base = buffer ? ggml_backend_buffer_get_base(buffer) : nullptr;
++    std::fprintf(stderr, "B1B_LIFECYCLE stage=%s tensor=%p name=%s data=%p buffer=%p buffer_base=%p buffer_size=%zu view_src=%p view_offs=%zu external=%d external_context=%p external_base=%p external_reserved=%zu registry_result=%d mode=%d\n",
++        stage, (const void *) tensor, ggml_get_name(tensor), tensor->data, (void *) buffer, buffer_base, buffer_size,
++        (void *) tensor->view_src, tensor->view_offs, external ? 1 : 0, external_context, external_base, external_reserved,
++        registry_result, ggml_expert_external_storage_enabled());
++    std::fflush(stderr);
++}
++
++static void b1b_check_target_buffer(const char * stage, ggml_context * ctx) {
++    const char * enabled = std::getenv("B1B_TRACE_BUFFER_WRITES");
++    if (!enabled || enabled[0] != '1' || !ctx) return;
++    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
++        if (std::strcmp(ggml_get_name(t), "blk.0.ffn_gate_exps.weight") != 0) continue;
++        static uintptr_t expected_tensor = 0;
++        static uintptr_t expected_buffer = 0;
++        const uintptr_t tensor_addr = (uintptr_t) t;
++        const uintptr_t field_addr = (uintptr_t) &t->buffer;
++        const uintptr_t current = (uintptr_t) t->buffer;
++        if (!expected_tensor && current) expected_tensor = tensor_addr;
++        if (!expected_buffer && tensor_addr == expected_tensor && current) expected_buffer = current;
++        std::fprintf(stderr,
++            "B1B_TBUFFER_CHECK stage=%s tensor=%p field=%p sizeof_tensor=%zu buffer_offset=%zu current=%p expected_tensor=%p expected_buffer=%p data=%p view_src=%p ctx=%p mem_buffer=%p mem_size=%zu used_mem=%zu no_alloc=%d tensor_range_in_ctx=%d\n",
++            stage, (void *) t, (void *) field_addr, sizeof(ggml_tensor), offsetof(ggml_tensor, buffer),
++            (void *) current, (void *) expected_tensor, (void *) expected_buffer, t->data, (void *) t->view_src,
++            (void *) ctx, ggml_get_mem_buffer(ctx), ggml_get_mem_size(ctx), ggml_used_mem(ctx),
++            ggml_get_no_alloc(ctx) ? 1 : 0,
++            ((uintptr_t) t >= (uintptr_t) ggml_get_mem_buffer(ctx) &&
++             (uintptr_t) t + sizeof(ggml_tensor) <= (uintptr_t) ggml_get_mem_buffer(ctx) + ggml_get_mem_size(ctx)) ? 1 : 0);
++        std::fflush(stderr);
++        if (tensor_addr == expected_tensor && expected_buffer && current != expected_buffer) {
++            std::fprintf(stderr,
++                "B1B_TBUFFER_FIRST_MISMATCH stage=%s tensor=%p field=%p current=%p expected_tensor=%p expected_buffer=%p\n",
++                stage, (void *) tensor_addr, (void *) field_addr, (void *) current,
++                (void *) expected_tensor, (void *) expected_buffer);
++            std::fflush(stderr);
++            // Diagnostic only: the expected object may have belonged to a
++            // context that has already been invalidated.  Do not turn this
++            // observation into an artificial process abort; lifetime evidence
++            // is recorded by the context invalidation instrumentation.
++        }
++        return;
++    }
++}
++
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
++    ggml_expert_external_memory_checkpoint("before_model_load");
+     const auto & split_mode   = params.split_mode;
+     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
+     const auto & tensor_split = params.tensor_split;
+@@ -1553,7 +1722,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+     }
++    ggml_expert_external_memory_checkpoint("before_done_getting_tensors");
+     ml.done_getting_tensors();
++    ggml_expert_external_memory_checkpoint("after_done_getting_tensors");
+ 
+     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
+     // If sidecar scales exist, the output weight must be an actual output tensor.
+@@ -1568,7 +1739,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    ggml_expert_external_memory_checkpoint("before_init_mappings");
+     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
++    ggml_expert_external_memory_checkpoint("after_init_mappings");
++    llama_validate_expert_storage(ml);
++    ggml_expert_external_memory_checkpoint("after_loader_validation");
+     pimpl->mappings.reserve(ml.mappings.size());
+ 
+     // create the backend buffers
+@@ -1578,8 +1753,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
+     const size_t n_max_backend_buffer = ml.ctx_map.size() * ml.files.size();
+     pimpl->ctxs_bufs.reserve(n_max_backend_buffer);
++    size_t no_alloc_external_preserved = 0;
+ 
++    ggml_expert_external_memory_checkpoint("before_backend_buffer_planning");
++    size_t b1b_context_index = 0;
+     for (auto & [buft, ctx_ptr] : ml.ctx_map) {
++        const size_t context_index = b1b_context_index++;
+         ggml_context * ctx = ctx_ptr.get();
+ 
+         // skip contexts without tensors
+@@ -1603,9 +1782,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         ggml_backend_dev_get_props(dev, &props);
+         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
+         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
++        const bool mmap_candidate = ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft;
++        std::fprintf(stderr, "B1B_MEM_CONTEXT stage=after_buft_selection index=%zu buft=%s mmap_candidate=%d no_alloc=%d\n",
++            context_index, ggml_backend_buft_name(buft), mmap_candidate ? 1 : 0, ml.no_alloc ? 1 : 0);
++        ggml_expert_external_memory_checkpoint("after_buft_selection");
+ 
+         std::vector<ggml_backend_buffer_ptr> bufs;
+-        if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++
++        // Allocate eligible external expert tensors before the ordinary
++        // context allocator runs. The allocator skips tensors that already
++        // have data, so CPU MoE experts never receive a full CUDA_Host copy.
++        ggml_expert_external_memory_checkpoint("before_external_preallocation");
++        if (ggml_expert_external_storage_enabled()) {
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++                if (!ggml_expert_external_is_tensor(t)) {
++                    continue;
++                }
++                if (t->buffer != nullptr || t->data != nullptr || t->view_src != nullptr) {
++                    ggml_expert_external_note_failure("tensor_not_unallocated", t);
++                    throw std::runtime_error(format("B1B external tensor already allocated name=%s", ggml_get_name(t)));
++                }
++                size_t reserved = 0, committed = 0;
++                ggml_backend_buffer_t ext = ggml_backend_cpu_external_expert_buffer(ggml_nbytes(t), &reserved, &committed);
++                if (!ext) {
++                    ggml_expert_external_note_failure("buffer_create", t);
++                    throw std::runtime_error(format("B1B external buffer creation failed name=%s", ggml_get_name(t)));
++                }
++                void * base = ggml_backend_buffer_get_base(ext);
++                if (ggml_backend_tensor_alloc(ext, t, base) != GGML_STATUS_SUCCESS) {
++                    ggml_backend_buffer_free(ext);
++                    ggml_expert_external_note_failure("tensor_alloc", t);
++                    throw std::runtime_error(format("B1B external tensor allocation failed name=%s", ggml_get_name(t)));
++                }
++                ggml_backend_buffer_set_usage(ext, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++                ggml_expert_external_note_tensor(ggml_nbytes(t), reserved, committed);
++                b1b_log_gate_expert_identity("after_external_prealloc", t, 1);
++                b1b_check_target_buffer("after_external_prealloc", ctx);
++                bufs.emplace_back(ext);
++            }
++        }
++
++        ggml_expert_external_memory_checkpoint("after_external_preallocation_context");
++        b1b_check_target_buffer("after_external_preallocation_context", ctx);
++        if (mmap_candidate) {
++            std::fprintf(stderr, "B1B_MEM_CONTEXT stage=before_mmap_buffer_allocation index=%zu buft=%s\n",
++                context_index, ggml_backend_buft_name(buft));
++            ggml_expert_external_memory_checkpoint("before_mmap_buffer_allocation");
+             GGML_ASSERT(!ml.no_alloc);
+             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
+@@ -1625,16 +1847,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 }
+                 bufs.emplace_back(buf);
+                 buf_map.emplace(idx, buf);
++                std::fprintf(stderr, "B1B_MEM_CONTEXT stage=after_mmap_buffer_allocation index=%zu buffer=%p size=%zu\n",
++                    context_index, (void *) buf, ggml_backend_buffer_get_size(buf));
++                ggml_expert_external_memory_checkpoint("after_mmap_buffer_allocation");
+             }
+         } else {
+             ggml_backend_buffer_t buf;
+             if (ml.no_alloc) {
+                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
+                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++                    if (ggml_backend_buffer_is_external_expert(t->buffer)) {
++                        void * external_context = nullptr;
++                        void * external_base = nullptr;
++                        size_t external_reserved = 0;
++                        const bool external = ggml_backend_buffer_external_expert_details(t->buffer,
++                            &external_context, &external_base, &external_reserved);
++                        ggml_expert_storage_info info = {};
++                        const bool registered = ggml_expert_storage_lookup(t, &info);
++                        if (!external || !t->data || t->data != external_base || !registered || !info.cpu_override) {
++                            ggml_expert_external_note_failure("no_alloc_external_invariant", t);
++                            throw std::runtime_error(format("B1B no_alloc external invariant failed name=%s tensor=%p data=%p base=%p buffer=%p registered=%d cpu_override=%d reserved=%zu context=%p",
++                                ggml_get_name(t), (void *) t, t->data, external_base, (void *) t->buffer,
++                                registered ? 1 : 0, info.cpu_override, external_reserved, external_context));
++                        }
++                        ++no_alloc_external_preserved;
++                        continue;
++                    }
+                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
+                 }
+             } else {
++                std::fprintf(stderr, "B1B_MEM_CONTEXT stage=before_backend_buffer_allocation index=%zu buft=%s\n",
++                    context_index, ggml_backend_buft_name(buft));
++                ggml_expert_external_memory_checkpoint("before_backend_buffer_allocation");
+                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
++                std::fprintf(stderr, "B1B_MEM_CONTEXT stage=after_backend_buffer_allocation index=%zu buffer=%p size=%zu\n",
++                    context_index, (void *) buf, buf ? ggml_backend_buffer_get_size(buf) : 0);
++                ggml_expert_external_memory_checkpoint("after_backend_buffer_allocation");
+             }
+             if (buf == nullptr) {
+                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+@@ -1651,6 +1899,52 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+         }
+ 
++        // B1b Phase 1: give selected CPU MoE expert tensors a logical,
++        // reserve-only buffer.  NORMAL mode and all non-expert tensors are
++        // intentionally unchanged.
++        if (ggml_expert_external_storage_enabled() || ggml_expert_placement_diagnostics_enabled()) {
++            for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++                b1b_log_gate_expert_identity("before_placement_lookup", t);
++                std::fprintf(stderr, "B1B_PLACEMENT_RECORD_BEGIN name=%s tensor=%p data=%p buffer=%p\n",
++                    ggml_get_name(t), (void *) t, t->data, (void *) t->buffer);
++                if (b1b_lookup_logging_on_model()) std::fprintf(stderr, "B1B_LOOKUP_CALL_BEGIN tensor=%p name=%s data=%p buffer=%p view_src=%p type=%d ne=%lld,%lld,%lld,%lld nb=%zu,%zu,%zu,%zu external=%d\n",
++                    (void *) t, ggml_get_name(t), t->data, (void *) t->buffer, (void *) t->view_src, (int) t->type,
++                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                    t->nb[0], t->nb[1], t->nb[2], t->nb[3],
++                    t->buffer && ggml_backend_buffer_is_external_expert(t->buffer) ? 1 : 0);
++                std::fflush(stderr);
++                ggml_expert_storage_info info = {};
++                if (!ggml_expert_storage_lookup(t, &info)) {
++                    b1b_log_gate_expert_identity("after_placement_lookup_not_registered", t, 0);
++                    if (b1b_lookup_logging_on_model()) std::fprintf(stderr, "B1B_LOOKUP_CALL_END result=not_registered tensor=%p\n", (void *) t);
++                    std::fflush(stderr);
++                    std::fprintf(stderr, "B1B_PLACEMENT_RECORD_END name=%s result=not_registered\n", ggml_get_name(t));
++                    continue;
++                }
++                b1b_log_gate_expert_identity("after_placement_lookup_found", t, 1);
++                if (b1b_lookup_logging_on_model()) std::fprintf(stderr, "B1B_LOOKUP_CALL_END result=found tensor=%p layer=%d kind=%d\n", (void *) t, info.layer, info.kind);
++                std::fflush(stderr);
++                std::fprintf(stderr, "B1B_PLACEMENT_STEP name=%s step=lookup_ok info_name=%s\n", ggml_get_name(t), info.name ? info.name : "<none>");
++                const bool cpu_candidate = info.cpu_override != 0;
++                const bool external_assigned = ggml_expert_external_is_tensor(t);
++                std::fprintf(stderr, "B1B_PLACEMENT_STEP name=%s step=device_fields cpu=%d\n", ggml_get_name(t), cpu_candidate ? 1 : 0);
++                const bool host_backed = ggml_backend_buft_is_host(buft);
++                std::fprintf(stderr, "B1B_PLACEMENT_STEP name=%s step=buft_fields host=%d\n", ggml_get_name(t), host_backed ? 1 : 0);
++                const char * memory_location = host_backed ? "host" : "device_or_cpu";
++                const bool external_eligible = ggml_expert_external_is_tensor(t);
++                ggml_backend_dev_t buft_dev = ggml_backend_buft_get_device(buft);
++                std::fprintf(stderr, "B1B_PLACEMENT_SEMANTICS name=%s layer=%d kind=%d logical_device=%s backend_device=%s buffer=%s memory_location=%s mmap_backed=%d host_backed=%d expected_compute_backend=%s actual_compute_backend=UNKNOWN external_eligible=%d\n",
++                    info.name ? info.name : "<none>", info.layer, info.kind,
++                    ggml_backend_dev_name(dev), buft_dev ? ggml_backend_dev_name(buft_dev) : "CPU/NULL",
++                    ggml_backend_buft_name(buft), memory_location, ml.use_mmap ? 1 : 0, host_backed ? 1 : 0,
++                    buft_dev ? ggml_backend_dev_name(buft_dev) : "CPU/NULL", external_eligible ? 1 : 0);
++                ggml_expert_external_note_placement(&info, cpu_candidate ? 1 : 0, mmap_candidate ? 1 : 0,
++                    external_assigned ? 1 : 0, ggml_backend_buft_name(buft), ggml_backend_dev_name(dev));
++                std::fprintf(stderr, "B1B_PLACEMENT_STEP name=%s step=note_ok\n", ggml_get_name(t));
++                std::fprintf(stderr, "B1B_PLACEMENT_RECORD_END name=%s result=recorded\n", ggml_get_name(t));
++            }
++        }
++
+         for (auto & buf : bufs) {
+             // indicate that this buffer contains weights
+             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
+@@ -1658,10 +1952,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+ 
+         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
++        std::fprintf(stderr, "B1B_MEM_CONTEXT stage=after_context_finalization index=%zu\n", context_index);
++        ggml_expert_external_memory_checkpoint("after_context_finalization");
++        b1b_check_target_buffer("after_context_finalization", ctx);
+ 
+         ctx_buf_maps.emplace_back(ctx, buf_map);
+     }
+ 
++    std::fprintf(stderr, "B1B_NO_ALLOC_STATS external_preserved=%zu\n", no_alloc_external_preserved);
++    ggml_expert_external_memory_checkpoint("after_external_preallocation");
++
+     if (llama_supports_gpu_offload()) {
+         const int n_gpu = std::min(n_gpu_layers, n_layer_all);
+ 
+@@ -1687,14 +1987,46 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     }
+ 
+     if (ml.no_alloc) {
++        ggml_expert_external_memory_checkpoint("after_ml_no_alloc_setup");
+         return true;
+     }
+ 
+     // load tensor data
+     for (auto & [ctx, buf_map] : ctx_buf_maps) {
++        b1b_check_target_buffer("before_load_all_data", ctx);
+         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+             return false;
+         }
++        b1b_check_target_buffer("after_load_all_data", ctx);
++    }
++
++    std::fprintf(stderr, "B1B pid=%lu tid=%lu EXPERT_REPORT_BEGIN\n",
++#ifdef _WIN32
++        (unsigned long) GetCurrentProcessId(), (unsigned long) GetCurrentThreadId()
++#else
++        0ul, 0ul
++#endif
++    );
++    std::fflush(stderr);
++    if (ggml_expert_external_storage_enabled() || ggml_expert_placement_diagnostics_enabled()) {
++        ggml_expert_external_report();
++    }
++    std::fprintf(stderr, "B1B pid=%lu tid=%lu EXPERT_REPORT_END\n",
++#ifdef _WIN32
++        (unsigned long) GetCurrentProcessId(), (unsigned long) GetCurrentThreadId()
++#else
++        0ul, 0ul
++#endif
++    );
++    std::fflush(stderr);
++
++    if (!llama_export_expert_ranges(ml, tensors_by_name)) {
++        LLAMA_LOG_ERROR("expert range manifest export failed\n");
++        return false;
++    }
++
++    for (auto & [ctx, buf_map] : ctx_buf_maps) {
++        b1b_check_target_buffer("after_expert_range_export", ctx);
+     }
+ 
+     if (use_mmap_buffer) {
+@@ -1755,11 +2087,79 @@ llama_split_mode llama_model::split_mode() const {
+ }
+ 
+ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
++    ggml_expert_external_memory_checkpoint("before_memory_breakdown");
+     std::map<ggml_backend_buffer_type_t, size_t> ret;
+     for (const auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+         if (hparams.no_alloc) {
+-            GGML_ASSERT(bufs.size() == 1);
+-            ggml_backend_buffer_t buf = bufs[0].get();
++            if (bufs.size() != 1) {
++                size_t tensor_count = 0;
++                for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                    tensor_count++;
++                }
++                std::fprintf(stderr, "B1B_MEMORY_BREAKDOWN_TOPOLOGY context=%p tensors=%zu bufs=%zu\n",
++                    (void *) ctx.get(), tensor_count, bufs.size());
++                for (size_t bi = 0; bi < bufs.size(); ++bi) {
++                    ggml_backend_buffer_t b = bufs[bi].get();
++                    void * ext_context = nullptr;
++                    void * ext_base = nullptr;
++                    size_t ext_reserved = 0;
++                    const bool external = ggml_backend_buffer_external_expert_details(b, &ext_context, &ext_base, &ext_reserved);
++                    size_t attached = 0;
++                    size_t logical = 0;
++                    for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
++                        if (t->buffer == b) {
++                            attached++;
++                            logical += ggml_nbytes(t);
++                        }
++                    }
++                    const char * trace_env = std::getenv("B1B_TRACE_BUFFER_BOUNDARY");
++                    const bool trace_boundary = trace_env && trace_env[0] == '1';
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_CALLER_BEGIN index=%zu buffer=%p\n", bi, (void *) b); std::fflush(stderr); }
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_TYPE_BEGIN buffer=%p\n", (void *) b); std::fflush(stderr); }
++                    ggml_backend_buffer_type_t breakdown_type = ggml_backend_buffer_get_type(b);
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_TYPE_END type=%p\n", (void *) breakdown_type); std::fflush(stderr); }
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_NAME_BEGIN buffer=%p\n", (void *) b); std::fflush(stderr); }
++                    const char * breakdown_name = ggml_backend_buffer_name(b);
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_NAME_END name=%s\n", breakdown_name ? breakdown_name : "<null>"); std::fflush(stderr); }
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_SIZE_BEGIN buffer=%p\n", (void *) b); std::fflush(stderr); }
++                    const size_t breakdown_size = ggml_backend_buffer_get_size(b);
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_SIZE_END size=%zu\n", breakdown_size); std::fflush(stderr); }
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_BASE_BEGIN buffer=%p\n", (void *) b); std::fflush(stderr); }
++                    void * breakdown_base = ggml_backend_buffer_get_base(b);
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_BASE_END base=%p\n", breakdown_base); std::fflush(stderr); }
++                    size_t breakdown_committed = 0;
++                    if (!external) {
++                        if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_COMMITTED_SIZE_BEGIN buffer=%p\n", (void *) b); std::fflush(stderr); }
++                        breakdown_committed = ggml_backend_buffer_get_size(b);
++                        if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_COMMITTED_SIZE_END size=%zu\n", breakdown_committed); std::fflush(stderr); }
++                    }
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_LOG_BEGIN buffer=%p\n", (void *) b); std::fflush(stderr); }
++                    std::fprintf(stderr,
++                        "B1B_MEMORY_BREAKDOWN_BUFFER index=%zu ptr=%p type=%s name=%s size=%zu base=%p external=%d ext_context=%p ext_base=%p ext_reserved=%zu attached=%zu logical=%zu committed=%zu\n",
++                        bi, (void *) b, ggml_backend_buft_name(breakdown_type), breakdown_name,
++                        breakdown_size, breakdown_base, external ? 1 : 0, ext_context, ext_base,
++                        ext_reserved, attached, logical, breakdown_committed);
++                    if (trace_boundary) { std::fprintf(stderr, "B1B_MEM_BREAKDOWN_LOG_END index=%zu\n", bi); std::fflush(stderr); }
++                }
++            }
++            ggml_backend_buffer_t buf = nullptr;
++            if (!ggml_expert_external_storage_enabled()) {
++                // Preserve the original no-alloc accounting contract for normal model loading.
++                GGML_ASSERT(bufs.size() == 1);
++                buf = bufs[0].get();
++            } else {
++                // External expert buffers describe reserved/file-backed logical ranges, not
++                // committed model RAM.  Keep exactly one ordinary planning buffer for the
++                // existing no-alloc accounting and ignore recognized external buffers here.
++                for (const auto & candidate : bufs) {
++                    if (ggml_backend_buffer_is_external_expert(candidate.get())) {
++                        continue;
++                    }
++                    GGML_ASSERT(buf == nullptr);
++                    buf = candidate.get();
++                }
++                GGML_ASSERT(buf != nullptr);
++            }
+             GGML_ASSERT(ggml_backend_buffer_get_base(buf) == nullptr);
+             ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buf);
+             ret[buft] += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+@@ -1770,6 +2170,7 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
+             }
+         }
+     }
++    ggml_expert_external_memory_checkpoint("after_memory_breakdown");
+     return ret;
+ }
+ 
+diff --git a/tools/cli/cli-context.cpp b/tools/cli/cli-context.cpp
+index 3d801b73d..9d434bd71 100644
+--- a/tools/cli/cli-context.cpp
++++ b/tools/cli/cli-context.cpp
+@@ -650,7 +650,7 @@ int cli_context::run() {
+ 
+         if (params.show_timings) {
+             ui::show_info(string_format(
+-                "\n[ Prompt: %.1f t/s | Generation: %.1f t/s ]",
++                "\n[ Prompt: %.3f t/s | Generation: %.3f t/s ]",
+                 timings.prompt_per_second,
+                 timings.predicted_per_second
+             ));
+diff --git a/tools/cli/main.cpp b/tools/cli/main.cpp
+index cb7d795b6..abeba28c4 100644
+--- a/tools/cli/main.cpp
++++ b/tools/cli/main.cpp
+@@ -1,5 +1,23 @@
++#include <cstdio>
++#ifdef _WIN32
++#include <windows.h>
++#endif
++
+ int llama_cli(int argc, char ** argv);
+ 
+ int main(int argc, char ** argv) {
+-    return llama_cli(argc, argv);
++#ifdef _WIN32
++    std::fprintf(stderr, "B1B pid=%lu tid=%lu PROCESS_START\n", (unsigned long) GetCurrentProcessId(), (unsigned long) GetCurrentThreadId());
++#else
++    std::fprintf(stderr, "B1B PROCESS_START\n");
++#endif
++    std::fflush(stderr);
++    const int result = llama_cli(argc, argv);
++#ifdef _WIN32
++    std::fprintf(stderr, "B1B pid=%lu tid=%lu PROCESS_EXIT code=%d\n", (unsigned long) GetCurrentProcessId(), (unsigned long) GetCurrentThreadId(), result);
++#else
++    std::fprintf(stderr, "B1B PROCESS_EXIT code=%d\n", result);
++#endif
++    std::fflush(stderr);
++    return result;
+ }
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 842e4203c..446bd1c5b 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -20,6 +20,9 @@
+ #include <algorithm>
+ #include <cstddef>
+ #include <cinttypes>
++#include <cstdlib>
++#include <chrono>
++#include <mutex>
+ #include <exception>
+ #include <memory>
+ #include <filesystem>
+@@ -37,6 +40,36 @@
+ 
+ using json = nlohmann::ordered_json;
+ 
++static void phase_trace(const char * event) {
++    static std::mutex mutex;
++    const char * path = std::getenv("LLAMA_PHASE_TRACE_OUT");
++    if (!path || !*path) return;
++    const auto now = std::chrono::steady_clock::now().time_since_epoch();
++    const auto us = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
++    std::lock_guard<std::mutex> lock(mutex);
++    std::ofstream out(path, std::ios::out | std::ios::app);
++    if (out) out << us << ' ' << event << '\n';
++}
++
++// Diagnostic-only capture of tokens selected by the server sampler.  The
++// file is opened lazily so model loading and prompt processing are unaffected.
++static std::ofstream g_token_trace;
++static int64_t g_token_trace_index = 0;
++
++static void trace_generated_token(llama_token id) {
++    if (!g_token_trace.is_open()) {
++        const char * path = std::getenv("LLAMA_TOKEN_TRACE_OUT");
++        if (!path || !*path) {
++            return;
++        }
++        g_token_trace.open(path, std::ios::out | std::ios::trunc);
++    }
++    if (g_token_trace.is_open()) {
++        g_token_trace << "TOKEN_TRACE index=" << g_token_trace_index++ << " id=" << id << "\n";
++        g_token_trace.flush();
++    }
++}
++
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+@@ -1337,6 +1370,8 @@ private:
+         // propagate new defaults back to caller
+         params = params_base;
+ 
++        phase_trace("MODEL_LOAD_END");
++
+         if (!is_resume) {
+             return init();
+         }
+@@ -3046,6 +3081,7 @@ private:
+ 
+                     // TODO: maybe move branch to outside of this loop in the future
+                     if (slot.state == SLOT_STATE_STARTED) {
++                        phase_trace("PROMPT_EVAL_BEGIN");
+                         slot.stats.update_prompt_start();
+ 
+                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+@@ -3497,6 +3533,7 @@ private:
+                     // entire prompt has been processed
+                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                         slot.state = SLOT_STATE_DONE_PROMPT;
++                        phase_trace("PROMPT_EVAL_END");
+ 
+                         GGML_ASSERT(batch.size() > 0);
+ 
+@@ -3741,6 +3778,7 @@ private:
+ 
+                 // prompt evaluated for next-token prediction
+                 slot.state = SLOT_STATE_GENERATING;
++                phase_trace("GENERATION_BEGIN");
+ 
+                 if (slot.can_speculate()) {
+                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+@@ -3762,6 +3800,8 @@ private:
+                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+             }
+ 
++            trace_generated_token(id);
++
+             slot.i_batch = -1;
+ 
+             common_sampler_accept(slot.smpl.get(), id, true);
+@@ -3790,6 +3830,7 @@ private:
+ 
+             if (!process_token(result, slot)) {
+                 // release slot because of stop condition
++                phase_trace("GENERATION_END");
+                 slot.print_timings();
+                 send_final_response(slot);
+                 slot.release();

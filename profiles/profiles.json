@@ -1,0 +1,249 @@
+{
+  "schema_version": "1.0.0",
+  "generated": "2026-08-24",
+  "model": {
+    "name": "Qwen3.6-35B-A3B",
+    "quantization": "Q4_K_M",
+    "file": "Qwen3.6-35B-A3B-Q4_K_M.gguf",
+    "bytes": 20419565568,
+    "architecture": "MoE, 35B total parameters, 3B active"
+  },
+  "reference_machine": {
+    "note": "Every tg_reference_toks value in this file was measured on this machine only. Numbers on other hardware will differ and are not guaranteed.",
+    "cpu": "Intel Core i5-14400F (10 cores / 16 threads)",
+    "ram_mib": 32581,
+    "gpu": "NVIDIA GeForce RTX 4060 8 GiB, driver 591.86",
+    "storage": "NVMe SSD",
+    "os": "Windows 11 Pro 10.0.26200 (25H2, UBR 9168)",
+    "measurement": "512-token generation, warm, same-session, 2-3 runs, context 16384"
+  },
+  "correctness_classes": {
+    "EXACT": {
+      "description": "Token stream is bit-identical to the project reference. Selecting any EXACT profile cannot change what the model produces; it changes only where expert weights live and how fast they arrive.",
+      "reference_512_token_trace_sha256": "414B86C6E75D7126C65D51EE96F144DC64E15562E30EEE574672FE0514ADC12B"
+    },
+    "REPACK": {
+      "description": "Uses llama.cpp's packed Q4_K GEMM kernels for the CPU MoE weights. Deterministic and thread-independent, but the accumulation order differs, so the greedy token stream diverges from the EXACT reference. Same model, same weights, same quantization, same routing, same active expert count.",
+      "reference_512_token_trace_sha256_prefix": "1D63259E5842DFE3",
+      "quality_statement": "No measurable quality degradation was observed on the tested English prose, C/C++ code, and Thai perplexity corpora. General quality equivalence is not claimed.",
+      "quality_evidence": [
+        {
+          "corpus": "C/C++ code, 400 KB",
+          "chunks": 40,
+          "ppl_exact": 1.6462,
+          "ppl_repack": 1.6448,
+          "delta_pct": -0.09
+        },
+        {
+          "corpus": "English prose, 460 KB",
+          "chunks": 40,
+          "ppl_exact": 4.8065,
+          "ppl_repack": 4.8196,
+          "delta_pct": 0.27
+        },
+        {
+          "corpus": "English prose, 356 KB",
+          "chunks": 24,
+          "ppl_exact": 5.9473,
+          "ppl_repack": 5.9626,
+          "delta_pct": 0.26
+        },
+        {
+          "corpus": "Thai prose, 22 KB",
+          "chunks": 7,
+          "ppl_exact": 5.7578,
+          "ppl_repack": 5.7568,
+          "delta_pct": -0.02
+        }
+      ]
+    }
+  },
+  "memory_model": {
+    "external_profiles": "peak_working_set_gib = 0.938 + cache_mib / 1024",
+    "note": "Measured constant from a 256 MiB cache upward. The fixed 0.938 GiB covers the resident non-expert weights, the KV cache at the stated context, and runtime overhead.",
+    "vram_note": "All profiles offload the non-MoE layers to the GPU and peak between 7.5 and 7.8 GiB of the 8 GiB card. A GPU with less than 8 GiB has not been tested.",
+    "server_overhead_gib": 1.95,
+    "server_note": "The per-profile figures above are the peak working set of a 512-token llama-cli generation from a short prompt - the benchmark configuration, and the one directly comparable to the 13.687 GiB the unmodified runtime uses when measured the same way. A llama-server session handling varied real requests at the same 16384 context settles about 1.95 GiB higher, because it touches the whole expert cache slab and fills far more KV cache. Measured across four profiles it was +1.98, +1.95, +1.91 and +1.95 GiB - constant, and independent of cache size. It plateaus: rounds 2 and 3 of a sustained session differed by 0.01 GiB. Budget profile figure + 1.95 GiB for a server."
+  },
+  "common": {
+    "gpu_layers": 999,
+    "n_cpu_moe": 30,
+    "context": 16384,
+    "flash_attention": "on",
+    "kv_cache_type_k": "q8_0",
+    "kv_cache_type_v": "q8_0",
+    "batch": 256,
+    "ubatch": 256,
+    "parallel": 1,
+    "load_mode": "none",
+    "load_mode_note": "The research benchmarks passed `--load-mode mmap -lm none`. `-lm` is an alias for `--load-mode`, so the last occurrence won and the effective mode was always `none`. The single flag `--load-mode none` here is exactly equivalent and is the honest spelling."
+  },
+  "profiles": [
+    {
+      "name": "TINY_MEMORY_EXACT",
+      "intended_user": "Smallest possible RAM footprint. Suitable for a machine that must keep most of its memory for other work, or for running alongside a desktop session with browsers and an IDE open.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "30",
+        "LLAMA_EXPERT_CACHE_MB": "512"
+      },
+      "expected_peak_working_set_gib": 1.442,
+      "expected_peak_private_gib": 8.465,
+      "expected_min_available_ram_gib": 21.95,
+      "expected_peak_vram_mib": 7565,
+      "tg_reference_toks": 12.661,
+      "tg_reference_tolerance_pct": 8,
+      "limitations": "Slowest of the external profiles. Every expert bundle miss is an SSD read, so throughput depends on NVMe latency; a SATA SSD or a hard disk has not been tested and will be materially slower.",
+      "guarantees": "Bit-identical token stream to the project reference."
+    },
+    {
+      "name": "MIN_MEMORY_EXACT",
+      "intended_user": "Low RAM budget with a meaningful speed gain over TINY. A good default for a 16 GiB machine.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "30",
+        "LLAMA_EXPERT_CACHE_MB": "2048"
+      },
+      "expected_peak_working_set_gib": 2.942,
+      "expected_peak_private_gib": 9.968,
+      "expected_min_available_ram_gib": 17.82,
+      "expected_peak_vram_mib": 7565,
+      "tg_reference_toks": 18.184,
+      "tg_reference_tolerance_pct": 8,
+      "limitations": "Same SSD dependence as TINY_MEMORY_EXACT.",
+      "guarantees": "Bit-identical token stream to the project reference."
+    },
+    {
+      "name": "LOW_MEMORY_EXACT",
+      "intended_user": "The project's headline low-memory point: over 20 tok/s in under 3.5 GiB of working set, bit-identical output. Recommended starting profile.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "30",
+        "LLAMA_EXPERT_CACHE_MB": "2560"
+      },
+      "expected_peak_working_set_gib": 3.443,
+      "expected_peak_private_gib": 10.471,
+      "expected_min_available_ram_gib": 17.4,
+      "expected_peak_vram_mib": 7565,
+      "tg_reference_toks": 20.785,
+      "tg_reference_tolerance_pct": 8,
+      "limitations": "Same SSD dependence as the other external profiles.",
+      "guarantees": "Bit-identical token stream to the project reference.",
+      "expected_peak_working_set_gib_server": 5.421
+    },
+    {
+      "name": "BALANCED_EXACT",
+      "intended_user": "The knee of the memory/throughput curve. Choose this when about 5 GiB of working set is acceptable and bit-identical output is required.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "30",
+        "LLAMA_EXPERT_CACHE_MB": "4096"
+      },
+      "expected_peak_working_set_gib": 4.943,
+      "expected_peak_private_gib": 11.973,
+      "expected_min_available_ram_gib": 15.82,
+      "expected_peak_vram_mib": 7565,
+      "tg_reference_toks": 24.673,
+      "tg_reference_tolerance_pct": 8,
+      "limitations": "Larger caches than this were measured (5120 and 6144 MiB) and are dominated: they cost 1-2 GiB more for throughput inside measurement noise.",
+      "guarantees": "Bit-identical token stream to the project reference.",
+      "expected_peak_working_set_gib_server": 6.889
+    },
+    {
+      "name": "MAX_SPEED_EXACT",
+      "intended_user": "Fastest configuration that still produces the bit-identical reference token stream. Requires a machine that can spare roughly 14 GiB of working set.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "2",
+        "LLAMA_EXPERT_CACHE_MB": "1024"
+      },
+      "expected_peak_working_set_gib": 13.755,
+      "expected_peak_private_gib": 20.883,
+      "expected_min_available_ram_gib": 8.11,
+      "expected_peak_vram_mib": 7707,
+      "tg_reference_toks": 32.268,
+      "tg_reference_tolerance_pct": 8,
+      "limitations": "Only the first two MoE layers use external storage; the other 28 are resident, which is where the memory goes. Throughput is capped near 32 tok/s by an upstream vec_dot thread-scaling characteristic that the unmodified resident path shares - more threads do not help this configuration.",
+      "guarantees": "Bit-identical token stream to the project reference.",
+      "expected_peak_working_set_gib_server": 15.78
+    },
+    {
+      "name": "MAX_SPEED_REPACK",
+      "intended_user": "Fastest overall. Use when raw throughput matters more than bit-identical reproduction of the reference token stream.",
+      "quality_class": "REPACK",
+      "threads": 12,
+      "env": {
+        "B1B_MOE_REPACK": "1"
+      },
+      "expected_peak_working_set_gib": 13.601,
+      "expected_peak_private_gib": 20.9,
+      "expected_min_available_ram_gib": 8.41,
+      "expected_peak_vram_mib": 7592,
+      "tg_reference_toks": 40.974,
+      "tg_reference_tolerance_pct": 8,
+      "limitations": "Does not use the external expert cache at all, so it has no low-memory story: all 30 CPU MoE layers are resident. Its token stream is NOT bit-identical to the EXACT reference. Quality evidence is perplexity on four corpora plus qualitative real-use inspection; that is not a general equivalence proof.",
+      "guarantees": "Deterministic and thread-independent output for a given prompt and seed. No measurable quality degradation on the tested corpora.",
+      "expected_peak_working_set_gib_server": 15.552
+    },
+    {
+      "name": "REFERENCE_CONTROL",
+      "intended_user": "Not a user profile. The unmodified llama.cpp resident path, used as the comparison baseline in benchmarks.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "env": {},
+      "expected_peak_working_set_gib": 13.687,
+      "expected_peak_private_gib": 20.821,
+      "expected_min_available_ram_gib": 8.16,
+      "expected_peak_vram_mib": 7776,
+      "tg_reference_toks": 29.346,
+      "tg_reference_tolerance_pct": 8,
+      "limitations": "Control only. No external expert cache, no repack.",
+      "guarantees": "Bit-identical token stream to the project reference.",
+      "hidden": true
+    }
+  ],
+  "additional_frontier_points": [
+    {
+      "cache_mib": 1024,
+      "tg_reference_toks": 14.888,
+      "peak_ws_gib": 1.942,
+      "quality_class": "EXACT"
+    },
+    {
+      "cache_mib": 1536,
+      "tg_reference_toks": 16.049,
+      "peak_ws_gib": 2.444,
+      "quality_class": "EXACT"
+    },
+    {
+      "cache_mib": 3072,
+      "tg_reference_toks": 22.51,
+      "peak_ws_gib": 3.943,
+      "quality_class": "EXACT"
+    }
+  ],
+  "rejected_configurations": [
+    {
+      "name": "LOW_MEMORY_REPACK",
+      "reason": "Implemented and measured. The packed kernels are worth only +4.7% on the external path against the +30% they give the resident path, which does not justify leaving the EXACT class. See docs/RESEARCH_HISTORY.md entry F3."
+    },
+    {
+      "name": "cache 5120 / 6144 MiB",
+      "reason": "Dominated by cache 4096 MiB: throughput inside noise, 1-2 GiB more memory."
+    },
+    {
+      "name": "-t 12 on the plain (non-repack) path",
+      "reason": "Dominated by the same configuration at -t 4. The plain vec_dot path does not scale past about 4 threads on this CPU."
+    }
+  ]
+}

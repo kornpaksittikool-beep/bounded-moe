@@ -1,0 +1,150 @@
+# ---------------------------------------------------------------------------
+# Model weights - NEVER commit. Multi-gigabyte, third-party licensed.
+# ---------------------------------------------------------------------------
+*.gguf
+*.ggml
+*.safetensors
+*.bin
+*.pt
+*.pth
+models/
+model/
+
+# ---------------------------------------------------------------------------
+# Clean-room source and build tree
+#
+# clean-room/llama.cpp is a checkout of upstream llama.cpp; it belongs in
+# upstream's repository, not this one. What this project actually owns is
+# patches/, which reconstructs it.
+# ---------------------------------------------------------------------------
+clean-room/llama.cpp/
+clean-room/build/
+clean-room/*.log
+build/
+build-*/
+out/
+cmake-build-*/
+
+# ---------------------------------------------------------------------------
+# Build artifacts and debug symbols
+# ---------------------------------------------------------------------------
+*.obj
+*.o
+*.a
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.dll
+*.exe
+*.so
+*.dylib
+*.res
+*.idb
+*.tlog
+*.ipdb
+*.iobj
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+.ninja_deps
+.ninja_log
+*.ninja
+
+# ---------------------------------------------------------------------------
+# Crash dumps and profiler output - can embed memory contents and local paths
+# ---------------------------------------------------------------------------
+*.dmp
+*.mdmp
+*.etl
+*.nvvp
+*.nsight-cuprof-report
+*.ncu-rep
+*.qdrep
+*.sqlite
+
+# ---------------------------------------------------------------------------
+# Benchmark and session output
+#
+# Raw logs contain absolute local paths, process ids, and machine identifiers.
+# Curated results that are meant to be published are force-added:
+#     git add -f benchmark/results/<name>/SUMMARY.md
+#     git add -f benchmark/results/<name>/results.csv
+#
+# tests/results/ carries the same shape of data for the real-use, quality-eval and
+# perplexity-matrix harnesses: real prompts, real model output, and machine-specific
+# environment JSON. Same rule - curate and force-add what you want published.
+# ---------------------------------------------------------------------------
+benchmark/results/
+tests/results/
+launcher/sessions/
+*.stdout.log
+*.stderr.log
+*.tokens.txt
+*.counters.txt
+*.perf.txt
+
+# ---------------------------------------------------------------------------
+# Evaluation corpora
+#
+# Derived data, not source: extracts of this project's own documentation, of
+# llama.cpp's C/C++ sources, and hand-written Thai prose. Excluded because they
+# are large, because one of them is a verbatim extract of upstream source, and
+# because they are not a standard benchmark anyone should treat as canonical.
+# docs/QUALITY_REPORT.md describes what they are so you can assemble your own.
+# ---------------------------------------------------------------------------
+tests/corpora/
+
+# ---------------------------------------------------------------------------
+# Secrets - none are used by this project; these patterns are a safety net
+# ---------------------------------------------------------------------------
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*_token
+*_secret
+credentials.json
+secrets.json
+.netrc
+.npmrc
+.pypirc
+
+# ---------------------------------------------------------------------------
+# Editor and OS
+# ---------------------------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---------------------------------------------------------------------------
+# Scratch
+# ---------------------------------------------------------------------------
+tmp/
+temp/
+scratch/
+__pycache__/
+*.py[cod]
+
+# ---------------------------------------------------------------------------
+# Internal Phase G tracking records
+#
+# These document the productization process itself, not the product: they name
+# the private local research workspace path repeatedly (D:\llm-v0\...) and are
+# meaningful mainly to whoever ran that phase, not to a user of the repo.
+# Per PUBLIC_RELEASE_CHECKLIST.md item 6.2, they are kept locally and not
+# published. Force-add individually if you decide otherwise.
+# ---------------------------------------------------------------------------
+/PRODUCTIZATION_BASELINE.md
+/PRODUCTIZATION_STATE.json
+/PRODUCTIZATION_LOG.md
+/PRODUCTIZATION_FINAL_REPORT.md

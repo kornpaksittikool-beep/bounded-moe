@@ -1,0 +1,5 @@
+@echo off
+rem Thin wrapper: all logic lives in run-local-moe.ps1.
+rem Usage: run-min-memory.cmd -Model <path to .gguf> [-Server] [-Port N] [any other run-local-moe.ps1 switch]
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run-local-moe.ps1" -Profile MIN_MEMORY_EXACT %*
+exit /b %ERRORLEVEL%
