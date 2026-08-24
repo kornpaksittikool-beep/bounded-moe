@@ -247,21 +247,20 @@
       "quality_class": "LONG_CONTEXT_LOW_RAM",
       "threads": 4,
       "context": 262144,
-      "n_cpu_moe": 40,
+      "n_cpu_moe": 37,
       "env": {
         "B1B_EXTERNAL_EXPERT_STORAGE": "1",
-        "B1B_EXTERNAL_MAX_LAYERS": "40",
-        "LLAMA_EXPERT_CACHE_MB": "2048"
+        "B1B_EXTERNAL_MAX_LAYERS": "37",
+        "LLAMA_EXPERT_CACHE_MB": "3072"
       },
-      "expected_peak_working_set_gib": 3.062,
-      "expected_peak_private_gib": 8.920,
-      "expected_min_available_ram_gib": 14.410,
-      "expected_peak_vram_mib": 6316,
-      "tg_reference_toks": 13.473,
+      "expected_peak_working_set_gib": 4.071,
+      "expected_peak_private_gib": 11.213,
+      "expected_min_available_ram_gib": 12.46,
+      "expected_peak_vram_mib": 7413,
+      "tg_reference_toks": 14.870,
       "tg_reference_tolerance_pct": 10,
-      "limitations": "Single run per point, not the alternating-build protocol - treat tg_reference_toks as +-10%. Retrieval correctness validated at ~44,000 tokens (at -c 65536), not at the full 262144-token window; that would take on the order of an hour of prompt processing and has not been run. llama-server validated directly at this profile: 4.08s load, five real requests (chat, code, reasoning, ~4000-token document, multi-turn) all completed, clean shutdown, zero stale processes. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
-      "guarantees": "Deterministic output for a given prompt and seed. Diverges from the EXACT reference token stream past token ~208 of the benchmark prompt (coherent, not corrupted) - see docs/LONG_CONTEXT.md section 3.",
-      "expected_peak_working_set_gib_server": 3.749
+      "limitations": "Tuned in a follow-on performance pass (docs/LONG_CONTEXT.md section 4 / autonomous-research/long-context-perf-research): -ncmoe lowered from 40 to 37 and cache raised from 2048 to 3072 MiB, recovering 62.5% of the gap to the 16K reference (11.865 -> 14.870 tok/s) at the cost of ~1 GiB more working set and less VRAM margin (~780 MiB vs 1712 MiB, still above the 512 MiB floor). Single run per point except this final configuration, which was confirmed 3x at 512 tokens matching this project's own protocol - treat tg_reference_toks as +-10%. Retrieval correctness validated at ~44,000 tokens (at -c 65536, pre-tuning config), not at the full 262144-token window or against this tuned configuration specifically. llama-server validated directly at the pre-tuning configuration only (ncmoe=40/cache=2048): 4.08s load, five real requests all completed, clean shutdown, zero stale processes - not yet re-validated at the tuned ncmoe=37/cache=3072 setting. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above. For lower working set at some cost in throughput, ncmoe=37/cache=2048 measures ~14.4 tok/s (256-token screen) at 3.07 GiB WS.",
+      "guarantees": "Deterministic output for a given prompt and seed. Diverges from the EXACT reference token stream past token ~208 of the benchmark prompt (coherent, not corrupted) - see docs/LONG_CONTEXT.md section 3."
     },
     {
       "name": "REFERENCE_CONTROL",

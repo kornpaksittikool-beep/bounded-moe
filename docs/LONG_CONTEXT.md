@@ -131,14 +131,62 @@ The updated `ggml-expert-indirection.cpp`/`.h` are already current in
 steps. To run:
 
 ```powershell
-llama-cli.exe -m Qwen3.6-35B-A3B-Q4_K_M.gguf -ngl 999 -ncmoe 40 -t 4 -fa on `
+llama-cli.exe -m Qwen3.6-35B-A3B-Q4_K_M.gguf -ngl 999 -ncmoe 37 -t 4 -fa on `
   -ctk q8_0 -ctv q8_0 -b 256 -ub 256 -c 262144 -np 1 --jinja
 ```
 
-with environment `B1B_EXTERNAL_EXPERT_STORAGE=1`, `B1B_EXTERNAL_MAX_LAYERS=40`,
-`LLAMA_EXPERT_CACHE_MB=2048`. `-c 65536` or `-c 131072` for the shorter-context profiles.
-None of the existing `TINY/LOW/MIN/BALANCED/MAX_SPEED_EXACT/REPACK` profiles or their
-flags change - this is purely additive.
+with environment `B1B_EXTERNAL_EXPERT_STORAGE=1`, `B1B_EXTERNAL_MAX_LAYERS=37`,
+`LLAMA_EXPERT_CACHE_MB=3072` (the tuned `LONG_CONTEXT_LOW_RAM_256K` settings - see
+section 4a). `-c 65536` or `-c 131072` for the shorter-context profiles, which still use
+the original `-ncmoe 40 cache=2048` settings pending their own tuning pass. None of the
+existing `TINY/LOW/MIN/BALANCED/MAX_SPEED_EXACT/REPACK` profiles or their flags change -
+this is purely additive.
+
+## 4a. Performance tuning (`ncmoe=40` -> `37`, cache `2048` -> `3072` MiB)
+
+A follow-on pass (`autonomous-research/long-context-perf-research/` in the working tree
+this document was written from) found that **90% of the throughput gap between the 16K
+reference and the untuned 256K profile came from `-ncmoe` itself, not from context
+length** - raising `-ncmoe` from 30 to 40 makes 40 layers' worth of experts compete for
+the same fixed cache budget that used to serve 30, which increases cache misses (+61.5%)
+and SSD read traffic (+47.9%) independent of context size. Isolated with two extra runs
+at a fixed `-c 16384`: the same `-ncmoe 30 -> 40` change costs 19.72 ms/token there too,
+versus only 2.01 ms/token from the context growth itself (16K -> 256K, `-ncmoe` fixed).
+
+Sweeping `-ncmoe` at 256K downward from 40 (each layer brought back GPU-resident costs
+about 432 MiB of VRAM) found a clean, monotonic tradeoff, self-limited by this project's
+own 512 MiB VRAM-margin floor:
+
+| `-ncmoe` | TG (512 tok, confirmed) | Peak VRAM | margin to 8188 MiB |
+|---:|---:|---:|---:|
+| 40 (original) | 11.865 | 6474-6478 MiB | 1712 MiB |
+| 38 | 13.209 | 6970-6979 MiB | ~1213 MiB |
+| **37** | **13.536** | 7404 MiB | 784 MiB |
+| 36 | (not confirmed - screen failed the margin floor) | 7770 MiB | 418 MiB, below the 512 MiB requirement |
+
+Cache size was then swept at the winning `ncmoe=37`: `3072 MiB` Pareto-dominates
+`4096 MiB` (statistically identical throughput, 1 GiB less working set), matching this
+project's own historical cache-knee finding at the 16K profiles. Thread count was
+reswept and confirmed unchanged (`-t 4` remains optimal, same reason as `E6`: this CPU's
+P-core/E-core split punishes anything past 4 threads).
+
+**Combined result**: `ncmoe=37` + `cache=3072 MiB` measures **14.870 +- 0.171 tok/s**
+(512 tokens, 3 runs) against the untuned profile's 11.865 - a **+25.3% relative gain,
+recovering 62.5% of the original gap to the 16K reference (16.672 tok/s, same-session
+remeasurement)** - at the cost of about 1 GiB more working set (3.06 -> 4.07 GiB) and
+less VRAM margin (1712 -> ~780 MiB, still comfortably above the 512 MiB floor).
+
+**Why not higher.** Base decode cost (attention + recurrent + MoE compute) plus the
+context-growth term alone floor at 64.56 ms/token (15.5 tok/s) at this context and
+hardware - reaching 20 tok/s would require running *below* that floor, i.e. below the
+cost of 256K context with zero cache-miss overhead at all, which does not fit this
+card's 8 GiB VRAM budget (the 16K-sized resident weights plus 256K's own KV/compute-scratch
+growth alone would need about 9.1 GiB). Full accounting:
+`autonomous-research/long-context-perf-research/LONG_CONTEXT_PERF_FINAL.md`.
+
+`LONG_CONTEXT_LOW_RAM_64K`/`128K` were not retuned in this pass - the `-ncmoe` effect
+measured almost context-independent, so the same tuning likely transfers, but that is an
+extrapolation, not a measurement.
 
 ## 5. What is not yet validated
 
