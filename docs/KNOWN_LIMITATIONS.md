@@ -175,15 +175,27 @@ the smaller one would understate what a server needs by two gigabytes.
 
 ## 8. Context length
 
-Every figure is at a **16384** context. The model's GGUF metadata declares support up to
-262144.
+Every figure in `profiles/profiles.json` and the profile table is at a **16384** context.
+The model's GGUF metadata declares support up to 262144.
 
 Memory scales with context: the KV cache is inside the 0.938 GiB fixed term at 16384 and
 will grow beyond it at larger contexts. **No profile's memory figure is valid at a context
 other than 16384.**
 
-Long-context behaviour is tested only to the extent recorded in `STABILITY_REPORT.md`.
-Do not read the profile table as a claim about 262144-token contexts.
+Long-context behaviour at the default `-ncmoe 30` placement is tested only to the extent
+recorded in `STABILITY_REPORT.md`. Do not read the profile table as a claim about
+262144-token contexts.
+
+A separate research pass (`docs/LONG_CONTEXT.md`) found and fixed a hardcoded 30-layer
+capacity in the external-expert cache that made `-ncmoe 40` regress to unbounded RAM
+instead of extending the bounded design, and used the fix to validate 65536, 131072, and
+262144 (the model's native ceiling) with Peak Working Set held to 3-4 GiB depending on
+cache budget, hash-identical output, real retrieval correctness at ~44,000 tokens, and a
+clean `llama-server` run. **This is reproducible from this repository's own `patches/`
+as of this commit, but it is not one of the profiles above and not a default** - see that
+document for exact flags, what is and is not validated, and its own list of open
+questions (full-depth retrieval past 44K tokens, Thai/code/multi-turn long-context
+retrieval specifically, and a 40-layer cache hit-rate accounting pass have not been run).
 
 ---
 
