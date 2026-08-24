@@ -200,20 +200,26 @@ if ($problems.Count -gt 0) {
 # --------------------------------------------------------------------------
 # build the command
 # --------------------------------------------------------------------------
+# A profile may carry its own context/n_cpu_moe (long-context profiles need both to
+# differ from the 16384/30 that every other profile shares); fall back to the common
+# block when it does not, which is every profile that existed before this.
+$defaultContext = if ($specProps -contains 'context')   { [int]$spec.context }   else { [int]$common.context }
+$defaultNCpuMoe = if ($specProps -contains 'n_cpu_moe')  { [int]$spec.n_cpu_moe } else { [int]$common.n_cpu_moe }
+
 $useThreads = if ($PSBoundParameters.ContainsKey('Threads')) { $Threads } else { [int]$spec.threads }
-$useContext = if ($PSBoundParameters.ContainsKey('Context')) { $Context } else { [int]$common.context }
+$useContext = if ($PSBoundParameters.ContainsKey('Context')) { $Context } else { $defaultContext }
 
 if ($PSBoundParameters.ContainsKey('Threads') -and $Threads -ne [int]$spec.threads) {
     [void]$warnings.Add("thread count overridden to $Threads (profile specifies $($spec.threads)). Thread count is one of the strongest effects measured in this project; the profile's reference throughput no longer applies.")
 }
-if ($PSBoundParameters.ContainsKey('Context') -and $Context -ne [int]$common.context) {
-    [void]$warnings.Add("context overridden to $Context (profiles were measured at $($common.context)). Memory figures will change.")
+if ($PSBoundParameters.ContainsKey('Context') -and $Context -ne $defaultContext) {
+    [void]$warnings.Add("context overridden to $Context (this profile was measured at $defaultContext). Memory figures will change.")
 }
 
 $argList = @(
     '-m', $Model
     '-ngl', '999'
-    '-ncmoe', "$($common.n_cpu_moe)"
+    '-ncmoe', "$defaultNCpuMoe"
     '-t', "$useThreads"
     '-fa', $common.flash_attention
     '-ctk', $common.kv_cache_type_k
@@ -246,7 +252,7 @@ Write-Host ("  binary         : {0}" -f $exe)
 Write-Host ("  model          : {0}" -f $Model)
 Write-Host ("  threads        : {0}" -f $useThreads)
 Write-Host ("  context        : {0}" -f $useContext)
-Write-Host ("  CPU MoE layers : {0}" -f $common.n_cpu_moe)
+Write-Host ("  CPU MoE layers : {0}" -f $defaultNCpuMoe)
 if ($envVars.Count -gt 0) {
     Write-Host '  environment    :'
     foreach ($k in ($envVars.Keys | Sort-Object)) { Write-Host ("{0,-34} = {1}" -f "    $k", $envVars[$k]) }

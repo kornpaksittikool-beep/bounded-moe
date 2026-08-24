@@ -196,6 +196,70 @@
       "expected_peak_working_set_gib_server": 15.552
     },
     {
+      "name": "LONG_CONTEXT_LOW_RAM_64K",
+      "intended_user": "Long-context work (up to 65536 tokens) with RAM still bounded. Requires the ggml-expert-indirection.cpp fix in this repo's patches/ (present as of this commit) - a build from an older checkout of patches/ will silently fall back to unbounded resident memory for layers 30-39. See docs/LONG_CONTEXT.md.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "context": 65536,
+      "n_cpu_moe": 40,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "40",
+        "LLAMA_EXPERT_CACHE_MB": "2048"
+      },
+      "expected_peak_working_set_gib": 2.959,
+      "expected_peak_private_gib": 6.351,
+      "expected_min_available_ram_gib": 13.811,
+      "expected_peak_vram_mib": 3888,
+      "tg_reference_toks": 10.436,
+      "tg_reference_tolerance_pct": 10,
+      "limitations": "Measured with a single run per point, not this project's alternating-build protocol (see docs/LONG_CONTEXT.md) - treat tg_reference_toks as +-10%, not +-8% like the 16384 profiles. No measured server working set for this context; budget the CLI figure plus the usual server overhead until measured. Retrieval correctness was validated at this context specifically with a ~44,000-token needle-in-haystack test, not at the full 65536-token window.",
+      "guarantees": "Bit-identical token stream to the project reference."
+    },
+    {
+      "name": "LONG_CONTEXT_LOW_RAM_128K",
+      "intended_user": "Long-context work (up to 131072 tokens) with RAM still bounded. Same requirement and caveats as LONG_CONTEXT_LOW_RAM_64K. See docs/LONG_CONTEXT.md.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "context": 131072,
+      "n_cpu_moe": 40,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "40",
+        "LLAMA_EXPERT_CACHE_MB": "2048"
+      },
+      "expected_peak_working_set_gib": 2.993,
+      "expected_peak_private_gib": 7.206,
+      "expected_min_available_ram_gib": 13.602,
+      "expected_peak_vram_mib": 4736,
+      "tg_reference_toks": 10.891,
+      "tg_reference_tolerance_pct": 10,
+      "limitations": "Same as LONG_CONTEXT_LOW_RAM_64K: single run per point, no measured server working set at this context, retrieval correctness validated at ~44,000 tokens (at -c 65536) rather than at this profile's own full window.",
+      "guarantees": "Bit-identical token stream to the project reference."
+    },
+    {
+      "name": "LONG_CONTEXT_LOW_RAM_256K",
+      "intended_user": "The model's full native context (262144, its n_ctx_train - going further needs RoPE extrapolation, out of scope) with RAM still bounded. The recommended long-context starting point. See docs/LONG_CONTEXT.md.",
+      "quality_class": "EXACT",
+      "threads": 4,
+      "context": 262144,
+      "n_cpu_moe": 40,
+      "env": {
+        "B1B_EXTERNAL_EXPERT_STORAGE": "1",
+        "B1B_EXTERNAL_MAX_LAYERS": "40",
+        "LLAMA_EXPERT_CACHE_MB": "2048"
+      },
+      "expected_peak_working_set_gib": 3.062,
+      "expected_peak_private_gib": 8.920,
+      "expected_min_available_ram_gib": 14.410,
+      "expected_peak_vram_mib": 6316,
+      "tg_reference_toks": 13.473,
+      "tg_reference_tolerance_pct": 10,
+      "limitations": "Single run per point, not the alternating-build protocol - treat tg_reference_toks as +-10%. Retrieval correctness validated at ~44,000 tokens (at -c 65536), not at the full 262144-token window; that would take on the order of an hour of prompt processing and has not been run. llama-server validated directly at this profile: 4.08s load, five real requests (chat, code, reasoning, ~4000-token document, multi-turn) all completed, clean shutdown, zero stale processes.",
+      "guarantees": "Bit-identical token stream to the project reference.",
+      "expected_peak_working_set_gib_server": 3.749
+    },
+    {
       "name": "REFERENCE_CONTROL",
       "intended_user": "Not a user profile. The unmodified llama.cpp resident path, used as the comparison baseline in benchmarks.",
       "quality_class": "EXACT",
