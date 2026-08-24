@@ -273,6 +273,13 @@ if ($spec.quality_class -eq 'REPACK') {
     Write-Host "  $($doc.correctness_classes.REPACK.quality_statement)" -ForegroundColor Yellow
     Write-Host ''
 }
+if ($spec.quality_class -eq 'LONG_CONTEXT_LOW_RAM') {
+    Write-Host 'NOTE: this is a LONG_CONTEXT_LOW_RAM profile.' -ForegroundColor Yellow
+    Write-Host '  Its token stream is deterministic but NOT bit-identical to the EXACT reference' -ForegroundColor Yellow
+    Write-Host '  past a few hundred tokens (coherent, not corrupted). See docs/LONG_CONTEXT.md.' -ForegroundColor Yellow
+    Write-Host "  $($doc.correctness_classes.LONG_CONTEXT_LOW_RAM.quality_statement)" -ForegroundColor Yellow
+    Write-Host ''
+}
 
 foreach ($w in $warnings) { Write-Host "WARNING: $w" -ForegroundColor Yellow }
 if ($warnings.Count -gt 0) { Write-Host '' }

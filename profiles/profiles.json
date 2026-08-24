@@ -22,6 +22,10 @@
       "description": "Token stream is bit-identical to the project reference. Selecting any EXACT profile cannot change what the model produces; it changes only where expert weights live and how fast they arrive.",
       "reference_512_token_trace_sha256": "414B86C6E75D7126C65D51EE96F144DC64E15562E30EEE574672FE0514ADC12B"
     },
+    "LONG_CONTEXT_LOW_RAM": {
+      "description": "Same weights, same routing, same active expert count, same resolver/cache mechanism as EXACT - but at -ncmoe values above 30, which were never validated at long generation lengths before this class was added. Retested at 512 tokens (this project's own EXACT standard), -ncmoe 31 through 40 all diverge from the EXACT reference token stream starting at the same token index (208, for the benchmark prompt/seed) and stay diverged for a coherent but different continuation. Deterministic across repeated runs, every safety counter clean, output coherent before and after the divergence - not corruption. Best-supported explanation, not confirmed: the same small non-zero logit differences already documented in docs/KNOWN_LIMITATIONS.md section 5 for the existing EXACT profiles, now large enough to flip one of the model's near-tied greedy decisions because -ncmoe > 30 had never been exercised at this generation length before. See docs/LONG_CONTEXT.md section 3.",
+      "quality_statement": "Do not label a -ncmoe > 30 configuration EXACT without re-verifying the 512-token hash for that specific configuration. -ncmoe <= 30 is unaffected (regression-tested byte-for-byte against the pre-existing EXACT reference)."
+    },
     "REPACK": {
       "description": "Uses llama.cpp's packed Q4_K GEMM kernels for the CPU MoE weights. Deterministic and thread-independent, but the accumulation order differs, so the greedy token stream diverges from the EXACT reference. Same model, same weights, same quantization, same routing, same active expert count.",
       "reference_512_token_trace_sha256_prefix": "1D63259E5842DFE3",
@@ -198,7 +202,7 @@
     {
       "name": "LONG_CONTEXT_LOW_RAM_64K",
       "intended_user": "Long-context work (up to 65536 tokens) with RAM still bounded. Requires the ggml-expert-indirection.cpp fix in this repo's patches/ (present as of this commit) - a build from an older checkout of patches/ will silently fall back to unbounded resident memory for layers 30-39. See docs/LONG_CONTEXT.md.",
-      "quality_class": "EXACT",
+      "quality_class": "LONG_CONTEXT_LOW_RAM",
       "threads": 4,
       "context": 65536,
       "n_cpu_moe": 40,
@@ -213,13 +217,13 @@
       "expected_peak_vram_mib": 3888,
       "tg_reference_toks": 10.436,
       "tg_reference_tolerance_pct": 10,
-      "limitations": "Measured with a single run per point, not this project's alternating-build protocol (see docs/LONG_CONTEXT.md) - treat tg_reference_toks as +-10%, not +-8% like the 16384 profiles. No measured server working set for this context; budget the CLI figure plus the usual server overhead until measured. Retrieval correctness was validated at this context specifically with a ~44,000-token needle-in-haystack test, not at the full 65536-token window.",
-      "guarantees": "Bit-identical token stream to the project reference."
+      "limitations": "Measured with a single run per point, not this project's alternating-build protocol (see docs/LONG_CONTEXT.md) - treat tg_reference_toks as +-10%, not +-8% like the 16384 profiles. No measured server working set for this context; budget the CLI figure plus the usual server overhead until measured. Retrieval correctness was validated at this context specifically with a ~44,000-token needle-in-haystack test, not at the full 65536-token window. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
+      "guarantees": "Deterministic output for a given prompt and seed. Diverges from the EXACT reference token stream past token ~208 of the benchmark prompt (coherent, not corrupted) - see docs/LONG_CONTEXT.md section 3."
     },
     {
       "name": "LONG_CONTEXT_LOW_RAM_128K",
       "intended_user": "Long-context work (up to 131072 tokens) with RAM still bounded. Same requirement and caveats as LONG_CONTEXT_LOW_RAM_64K. See docs/LONG_CONTEXT.md.",
-      "quality_class": "EXACT",
+      "quality_class": "LONG_CONTEXT_LOW_RAM",
       "threads": 4,
       "context": 131072,
       "n_cpu_moe": 40,
@@ -234,13 +238,13 @@
       "expected_peak_vram_mib": 4736,
       "tg_reference_toks": 10.891,
       "tg_reference_tolerance_pct": 10,
-      "limitations": "Same as LONG_CONTEXT_LOW_RAM_64K: single run per point, no measured server working set at this context, retrieval correctness validated at ~44,000 tokens (at -c 65536) rather than at this profile's own full window.",
-      "guarantees": "Bit-identical token stream to the project reference."
+      "limitations": "Same as LONG_CONTEXT_LOW_RAM_64K: single run per point, no measured server working set at this context, retrieval correctness validated at ~44,000 tokens (at -c 65536) rather than at this profile's own full window. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
+      "guarantees": "Deterministic output for a given prompt and seed. Diverges from the EXACT reference token stream past token ~208 of the benchmark prompt (coherent, not corrupted) - see docs/LONG_CONTEXT.md section 3."
     },
     {
       "name": "LONG_CONTEXT_LOW_RAM_256K",
       "intended_user": "The model's full native context (262144, its n_ctx_train - going further needs RoPE extrapolation, out of scope) with RAM still bounded. The recommended long-context starting point. See docs/LONG_CONTEXT.md.",
-      "quality_class": "EXACT",
+      "quality_class": "LONG_CONTEXT_LOW_RAM",
       "threads": 4,
       "context": 262144,
       "n_cpu_moe": 40,
@@ -255,8 +259,8 @@
       "expected_peak_vram_mib": 6316,
       "tg_reference_toks": 13.473,
       "tg_reference_tolerance_pct": 10,
-      "limitations": "Single run per point, not the alternating-build protocol - treat tg_reference_toks as +-10%. Retrieval correctness validated at ~44,000 tokens (at -c 65536), not at the full 262144-token window; that would take on the order of an hour of prompt processing and has not been run. llama-server validated directly at this profile: 4.08s load, five real requests (chat, code, reasoning, ~4000-token document, multi-turn) all completed, clean shutdown, zero stale processes.",
-      "guarantees": "Bit-identical token stream to the project reference.",
+      "limitations": "Single run per point, not the alternating-build protocol - treat tg_reference_toks as +-10%. Retrieval correctness validated at ~44,000 tokens (at -c 65536), not at the full 262144-token window; that would take on the order of an hour of prompt processing and has not been run. llama-server validated directly at this profile: 4.08s load, five real requests (chat, code, reasoning, ~4000-token document, multi-turn) all completed, clean shutdown, zero stale processes. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
+      "guarantees": "Deterministic output for a given prompt and seed. Diverges from the EXACT reference token stream past token ~208 of the benchmark prompt (coherent, not corrupted) - see docs/LONG_CONTEXT.md section 3.",
       "expected_peak_working_set_gib_server": 3.749
     },
     {

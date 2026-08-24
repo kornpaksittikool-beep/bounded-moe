@@ -11,6 +11,12 @@ Building them requires the updated `ggml-expert-indirection.cpp` in `patches/new
 (already current in this repo as of this document) - a build from an older checkout of
 this repo's `patches/` will not have the fix described below.
 
+**These profiles are not EXACT.** `-ncmoe` values above 30 measurably diverge from the
+EXACT reference token stream past a few hundred tokens (still coherent, not corrupted -
+see section 3). An earlier version of this document claimed bit-identity; that was
+checked only at 128 tokens and did not hold at this project's own 512-token EXACT
+standard. Corrected here.
+
 ---
 
 ## 1. Why context scales the way it does here
@@ -80,14 +86,43 @@ A lower-RAM point exists at every context (`cache=1024 MiB`: 8.7/9.0/11.5 tok/s 
 throughput bar at every context tested while staying inside a 4 GiB working-set budget by
 a wide margin at 64K/128K and a comfortable margin at 256K.
 
-**Correctness:** every configuration in the table above reproduces the identical greedy
-token-stream hash to the 16384 baseline, on the same short-prompt benchmark this project
-uses elsewhere. A needle-in-haystack retrieval test (~44,000 tokens of synthetic
-briefing document, two facts planted early and two-thirds through) recovered both facts
-verbatim with correct section attribution. `llama-server` was validated separately at the
-256K profile: 4.08 s load, five real requests (chat, code, a reasoning question, a
-~4000-token document, a multi-turn follow-up) all completed, Peak WS 3.75 GiB, Peak VRAM
-6672 MiB, clean shutdown, zero stale processes.
+**Correctness - corrected.** An earlier version of this document claimed every
+configuration above reproduces the identical greedy token-stream hash to the 16384
+baseline. That was true at the short generation length (128 tokens) it was checked at,
+and false at the 512-token length this project's own EXACT claim is defined against.
+Retested at 512 tokens: **`-ncmoe` values above 30 (every profile in this document uses
+`-ncmoe 40`) diverge from the EXACT reference starting at token 208** of this specific
+benchmark prompt/seed, and stay diverged (a different but still coherent continuation)
+for the rest of the generation. This reproduces exactly - `-ncmoe 31` diverges at the
+identical token index as `-ncmoe 40` - and is deterministic across repeated runs; every
+safety counter (`pins==unpins`, `current_pins=0`, `resolver_failures=0`,
+`short_read_count=0`) stays clean throughout, and the generated text itself is coherent
+before and after the divergence point, not garbled. The most likely explanation is the
+same one this project's own `KNOWN_LIMITATIONS.md` §5 already documents for the existing
+EXACT profiles at their tested settings - small, non-zero logit differences depending on
+how many layers are external - now visible as an actual token flip because `-ncmoe > 30`
+had never been tested at a long enough generation to hit one of the model's near-tied
+greedy decisions. **This has not been proven to be that mechanism specifically** - it is
+the best-supported explanation given the evidence collected (deterministic, coherent,
+counter-clean, and the divergence point is `-ncmoe`-magnitude-independent), not a
+confirmed root cause.
+
+**Practical consequence: these profiles are not EXACT.** They are the same weights, same
+routing, same active expert count, same resolver/cache mechanism as the EXACT profiles -
+nothing about *what* is computed changes - but the token stream is not proven bit-
+identical past a few hundred tokens, so they must not be labelled EXACT. See
+`profiles/profiles.json`'s `LONG_CONTEXT_LOW_RAM` correctness class for the precise
+wording now used.
+
+A needle-in-haystack retrieval test (~44,000 tokens of synthetic briefing document, two
+facts planted early and two-thirds through) recovered both facts verbatim with correct
+section attribution - this remains valid evidence against silent truncation/corruption,
+independent of the EXACT-vs-not-EXACT question above (a different, non-reference
+continuation can still correctly retrieve facts from its own context). `llama-server` was
+validated separately at the 256K profile: 4.08 s load, five real requests (chat, code, a
+reasoning question, a ~4000-token document, a multi-turn follow-up) all completed, Peak WS
+3.75 GiB, Peak VRAM 6672 MiB, clean shutdown, zero stale processes - none of that is
+affected by the correctness-class correction either.
 
 ## 4. Building and running
 
