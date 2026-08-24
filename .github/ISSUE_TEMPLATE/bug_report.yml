@@ -1,0 +1,91 @@
+name: Bug report
+description: Report a reproducible bounded-moe bug, crash, build failure, or incorrect behavior
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Please include enough detail for someone else to reproduce it.
+        Do not include API keys, tokens, private paths, or other secrets.
+  - type: input
+    id: version
+    attributes:
+      label: bounded-moe version / commit
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and quantization
+      placeholder: Qwen3.6-35B-A3B Q4_K_M
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware and OS
+      description: Include CPU, GPU, VRAM, RAM, storage type, and Windows version.
+      placeholder: |
+        CPU:
+        GPU / VRAM:
+        RAM:
+        Storage:
+        OS:
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: Profile
+      placeholder: LOW_MEMORY_EXACT
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include the full relevant error message or crash details.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove secrets and personal information before posting.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I checked the README and KNOWN_LIMITATIONS.md.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I removed secrets and personal information from logs and commands.
+          required: true

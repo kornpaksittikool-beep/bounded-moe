@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Benchmarks & Hardware Discussions
+    url: https://github.com/kornpaksittikool-beep/bounded-moe/discussions
+    about: Share normal benchmark results and hardware reports in Discussions.
+  - name: Questions and ideas
+    url: https://github.com/kornpaksittikool-beep/bounded-moe/discussions
+    about: Ask usage questions or discuss ideas before opening an issue.

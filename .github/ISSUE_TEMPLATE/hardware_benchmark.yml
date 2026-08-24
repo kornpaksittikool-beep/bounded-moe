@@ -1,0 +1,74 @@
+name: Hardware compatibility report
+description: Report a hardware compatibility result that is better tracked as an issue
+title: "[Hardware]: "
+labels: ["hardware"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For normal benchmark sharing, please prefer the **Benchmarks & Hardware** category in GitHub Discussions.
+        Use this issue form when the result exposes a compatibility problem, regression, or reproducible limitation.
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware
+      placeholder: |
+        CPU:
+        GPU:
+        VRAM:
+        RAM:
+        Storage:
+        OS:
+    validations:
+      required: true
+  - type: textarea
+    id: model
+    attributes:
+      label: Model
+      placeholder: |
+        Model:
+        Quantization:
+        Model size:
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: bounded-moe configuration
+      placeholder: |
+        Version / commit:
+        Profile:
+        Expert cache size:
+        Threads:
+        Context size:
+        Batch / micro-batch:
+    validations:
+      required: true
+  - type: textarea
+    id: results
+    attributes:
+      label: Results
+      placeholder: |
+        Prompt processing: tok/s
+        Token generation: tok/s
+        Peak working set / RAM: GiB
+        Peak VRAM: MiB
+        TTFT: s
+        Reference hash (if tested):
+        Number of runs:
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Compatibility problem or observation
+      description: Explain what should be investigated or tracked.
+    validations:
+      required: true
