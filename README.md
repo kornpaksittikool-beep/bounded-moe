@@ -158,7 +158,10 @@ Full detail, including the cost accounting and the ceiling: `docs/ARCHITECTURE.m
 - **NVMe assumed.** The low-memory profiles read 405 MiB of expert bundles per token. A
   SATA SSD or hard disk is untested and will be materially slower.
 - **8 GiB VRAM assumed.** Smaller cards are untested; CPU-only is untested.
-- **Context 16384.** Every memory figure is at that context with a short prompt.
+- **Context 16384.** Every memory figure in the table above is at that context with a
+  short prompt. A follow-on research pass validated 65536/131072/262144 (the model's
+  native maximum) with RAM still bounded - see `docs/LONG_CONTEXT.md`. It is not yet a
+  default profile.
 - **Single sequence.** Parallel serving is untested.
 - **The low-memory path is copy bound** and near its architectural ceiling — 78 % of the
   bound where the copy is free. Removing the copy means mapping, which means losing the
@@ -200,6 +203,7 @@ different memory footprints produces results that are stable, repeatable, and wr
 | `docs/PERFORMANCE.md` | the frontier, the cost accounting, what moves it and what does not |
 | `docs/QUALITY_REPORT.md` | EXACT vs REPACK, measured |
 | `docs/RESEARCH_HISTORY.md` | every experiment, including the failures and the methodology errors |
+| `docs/LONG_CONTEXT.md` | pushing context from 16384 to the model's native 262144 with RAM still bounded - researched and reproducible, not yet a default |
 | `docs/DESIGN_DECISIONS.md` | each decision, its alternatives, and the evidence |
 | `docs/KNOWN_LIMITATIONS.md` | everything this does not do or cannot claim |
 | `docs/BUILD_FROM_CLEAN.md` | the build, its traps, and what the clean build proved |

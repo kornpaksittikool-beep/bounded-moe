@@ -61,7 +61,7 @@
 // B2d timing observability. Disabled unless B2D_TIMING_PATH is set. The probe
 // stores integer keys and QPC ticks only; it never writes from the hot path.
 static constexpr size_t B2D_MAX_EVENTS = 65536;
-static constexpr size_t B2D_KEY_COUNT = 30 * 256;
+static constexpr size_t B2D_KEY_COUNT = 40 * 256;
 struct b2d_event {
     uint64_t route = 0;
     uint64_t resolve = 0;
@@ -104,7 +104,7 @@ static uint64_t b2d_now() {
 }
 
 static int b2d_key(int layer, int expert) {
-    return layer >= 0 && layer < 30 && expert >= 0 && expert < 256 ? layer * 256 + expert : -1;
+    return layer >= 0 && layer < 40 && expert >= 0 && expert < 256 ? layer * 256 + expert : -1;
 }
 
 extern "C" int ggml_expert_b2d_enabled(void) {
@@ -1267,7 +1267,7 @@ static std::once_flag g_validation_once;
 static std::atomic<bool> g_validation_started{false};
 static std::atomic<bool> g_validation_completed{false};
 static uint64_t g_validation_pass = 0, g_validation_fail = 0, g_validation_bytes = 0;
-static bool g_validated[30][3][256] = {};
+static bool g_validated[40][3][256] = {};
 static std::mutex g_validation_mutex;
 static thread_local bool g_trace_validation_current = false;
 
@@ -1311,7 +1311,7 @@ static void validate_current(const ggml_tensor * tensor, const ggml_expert_stora
     b1b_breadcrumb(160, 21, info.layer, info.kind, expert_id, tensor);
     b1b_breadcrumb(170, buffer_external ? 1 : 0, info_copy.layer, info_copy.kind, expert_id, tensor);
     b1b_breadcrumb(160, 22, info.layer, info.kind, expert_id, tensor);
-    if (info_copy.layer < 0 || info_copy.layer >= 30 || info_copy.kind < 0 || info_copy.kind >= 3) {
+    if (info_copy.layer < 0 || info_copy.layer >= 40 || info_copy.kind < 0 || info_copy.kind >= 3) {
         b1b_breadcrumb(160, 23, info.layer, info.kind, expert_id, tensor);
         return;
     }
@@ -1444,7 +1444,7 @@ static bool parse_expert_registry_name(const char * name, int & layer, int & kin
 extern "C" void ggml_expert_storage_register(const ggml_expert_storage_info * info) {
     if (!info || !info->name) return;
     int parsed_layer = -1, parsed_kind = -1;
-    if (!parse_expert_registry_name(info->name, parsed_layer, parsed_kind) || parsed_layer < 0 || parsed_layer >= 30 || info->layer != parsed_layer || info->kind != parsed_kind) return;
+    if (!parse_expert_registry_name(info->name, parsed_layer, parsed_kind) || parsed_layer < 0 || parsed_layer >= 40 || info->layer != parsed_layer || info->kind != parsed_kind) return;
     std::lock_guard<std::mutex> lock(g_storage_mutex);
     auto existing = g_storage_by_name.find(info->name);
     if (existing != g_storage_by_name.end()) {
@@ -1470,11 +1470,11 @@ extern "C" int ggml_expert_storage_registry_validate(void) {
         const auto & x = item.second;
         int layer = -1, kind = -1;
         parse_expert_registry_name(item.first.c_str(), layer, kind);
-        if (layer < 0 || layer >= 30 || kind < 0 || x.layer != layer || x.kind != kind || x.plane_size != 589824 || x.n_experts != 256 || !keys.emplace(layer, kind).second) { ++invalid; continue; }
+        if (layer < 0 || layer >= 40 || kind < 0 || x.layer != layer || x.kind != kind || x.plane_size != 589824 || x.n_experts != 256 || !keys.emplace(layer, kind).second) { ++invalid; continue; }
         ++counts[kind];
     }
     const int cpu_layers = counts[0];
-    bool contiguous = cpu_layers >= 1 && cpu_layers <= 30;
+    bool contiguous = cpu_layers >= 1 && cpu_layers <= 40;
     for (int layer = 0; contiguous && layer < cpu_layers; ++layer) {
         for (int kind = 0; kind < 3; ++kind) contiguous = keys.count({layer, kind}) == 1;
     }
@@ -1812,7 +1812,7 @@ static bool verify_only() { const char * p = std::getenv("CACHE_LOAD_VERIFY_ONLY
 static bool parse_metadata(const char * name, int & layer, const char * & kind) {
     if (!name || std::strncmp(name, "blk.", 4) != 0) return false;
     char * end = nullptr; layer = (int) std::strtol(name + 4, &end, 10);
-    if (end == name + 4 || layer < 0 || layer >= 30) return false;
+    if (end == name + 4 || layer < 0 || layer >= 40) return false;
     if (std::strstr(name, ".ffn_gate_exps.")) kind = "gate";
     else if (std::strstr(name, ".ffn_up_exps.")) kind = "up";
     else if (std::strstr(name, ".ffn_down_exps.")) kind = "down";
