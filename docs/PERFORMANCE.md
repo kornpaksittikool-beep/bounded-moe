@@ -237,6 +237,17 @@ measured as only moderate, with tiering rejected on migration and thrash grounds
 
 ---
 
+## 9a. Long context (16K -> 262144)
+
+A follow-on research pass found that 90% of the throughput gap between the 16384
+reference and an untuned 256K-context run came from `-ncmoe` cache pressure (more
+external layers sharing the same cache budget), not from context length itself - the
+context-growth term alone measured only ~2.4% of total decode cost. Tuning `-ncmoe` and
+cache size per context recovered most of that gap: 14.870 tok/s at 262144 context versus
+an 11.865 tok/s untuned starting point, on the same hardware this file's other figures
+come from. Full accounting, per-layer cost breakdown, and the thread/cache sweeps behind
+it: `docs/LONG_CONTEXT.md` and `autonomous-research/long-context-perf-research/`.
+
 ## 9. Open performance questions
 
 - **Why four workers beat six on a six P-core part.** Memory bandwidth saturating at four

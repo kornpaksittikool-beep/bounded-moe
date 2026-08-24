@@ -247,7 +247,10 @@ foreach ($prop in $spec.env.PSObject.Properties) { $envVars[$prop.Name] = [strin
 # --------------------------------------------------------------------------
 Write-Host ''
 Write-Host "=== resolved configuration ===" -ForegroundColor Cyan
-Write-Host ("  profile        : {0}  ({1})" -f $spec.name, $spec.quality_class)
+Write-Host ("  profile        : {0}" -f $spec.name)
+$classDoc = $doc.correctness_classes.PSObject.Properties[$spec.quality_class]
+Write-Host ("  correctness    : {0}" -f $spec.quality_class)
+if ($classDoc) { Write-Host ("                   {0}" -f $classDoc.Value.description) -ForegroundColor DarkGray }
 Write-Host ("  binary         : {0}" -f $exe)
 Write-Host ("  model          : {0}" -f $Model)
 Write-Host ("  threads        : {0}" -f $useThreads)

@@ -188,10 +188,12 @@ recorded in `STABILITY_REPORT.md`. Do not read the profile table as a claim abou
 
 A separate research pass (`docs/LONG_CONTEXT.md`) found and fixed a hardcoded 30-layer
 capacity in the external-expert cache that made `-ncmoe 40` regress to unbounded RAM
-instead of extending the bounded design, and used the fix to validate 65536, 131072, and
-262144 (the model's native ceiling) with Peak Working Set held to 3-4 GiB depending on
-cache budget, real retrieval correctness at ~44,000 tokens, and a clean `llama-server`
-run - available as opt-in profiles (`LONG_CONTEXT_LOW_RAM_64K/128K/256K` in
+instead of extending the bounded design, then independently measured (not inferred) a
+tuned `-ncmoe`/cache Pareto point at each of 65536, 131072, and 262144 (the model's
+native ceiling): Peak Working Set 3.97-4.07 GiB, VRAM margin 780 MiB-1.2 GiB, real
+retrieval correctness at up to ~245,000 tokens (94% of the 262144 window, spanning
+English, Thai, and code content), and a clean 11-request `llama-server` session -
+available as opt-in profiles (`LONG_CONTEXT_LOW_RAM_64K/128K/256K` in
 `profiles/profiles.json`), not defaults.
 
 **These are not EXACT.** Retested at 512 tokens (this project's own EXACT standard, not
@@ -202,8 +204,22 @@ after - see `docs/LONG_CONTEXT.md` section 3 for the full account, including wha
 is not confirmed about the cause. `-ncmoe <= 30` (every other profile in this file) is
 unaffected and was regression-tested byte-for-byte.
 
-Also open: full-depth retrieval past 44K tokens, Thai/code/multi-turn long-context
-retrieval specifically, and a 40-layer cache hit-rate accounting pass.
+**`nvidia-smi`'s VRAM figure under-reports what llama.cpp's own allocator logs as the
+logical buffer size, by roughly 1.9 GiB at 262144 context, for a reason not fully
+explained** (candidate cause: Windows/WDDM memory virtualization reporting only resident
+pages). Directly tested with a genuine ~44,000-token prompt run to completion: VRAM
+reached its steady reading within 30 seconds of load and stayed flat for the remaining
+~14.5 minutes of real processing - it does not climb progressively as the KV cache fills,
+which rules out a "lazily-committed buffer that eventually catches up" explanation. This
+means `-ncmoe 30` itself does not actually exceed VRAM at 262144 context (contrary to an
+earlier prediction in this research, based on the uncorrected logical-size formula) - but
+it is still measurably slower and uses more RAM than the tuned `-ncmoe 37` point, so the
+tuned profiles remain the recommendation regardless. See `docs/LONG_CONTEXT.md` section
+4b.
+
+Also open: Thai/code/multi-turn long-context retrieval specifically (only English/Thai/
+code *content* was tested, not a dedicated long-context test of each independently), and
+a per-`-ncmoe`-value cache hit-rate accounting pass.
 
 ---
 

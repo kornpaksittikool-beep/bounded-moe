@@ -20,6 +20,8 @@ model/
 clean-room/llama.cpp/
 clean-room/build/
 clean-room/*.log
+release-candidate/llama.cpp/
+release-candidate/build/
 build/
 build-*/
 out/

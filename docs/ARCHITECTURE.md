@@ -409,3 +409,11 @@ affected.
   throughput. "The cache locks are the bottleneck" is disproven.
 
 `RESEARCH_HISTORY.md` records these with their measurements.
+
+## 11. Long context
+
+Everything above is described at the project's 16384-context default. A follow-on
+research pass extends the same architecture (SSD-backed bounded expert cache, KV/context
+state on GPU VRAM) out to the model's native 262144-token ceiling without giving up the
+bounded-RAM design, fixing a hardcoded 30-layer capacity in the registry along the way.
+See `docs/LONG_CONTEXT.md` for the design, the fix, and the measured results.

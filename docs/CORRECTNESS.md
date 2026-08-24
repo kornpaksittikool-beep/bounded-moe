@@ -265,6 +265,47 @@ It is never called "lossless".
 
 ---
 
+## 8a. LONG_CONTEXT_LOW_RAM: what is and is not claimed
+
+Raising `-ncmoe` above 30 (every `LONG_CONTEXT_LOW_RAM_*` profile does, up to 37) was
+found, in a follow-on research pass, to diverge from the EXACT reference token stream at
+a fixed point - token 208 of this project's own benchmark prompt - regardless of whether
+`-ncmoe` is 31 or 40, and regardless of cache size. The registration/resolver/cache
+mechanism did not change and is not the cause: `-ncmoe <= 30` remains byte-for-byte
+identical to the pre-existing reference, regression-tested directly against it.
+
+**Verified:**
+
+- **Deterministic** - repeated runs at the exact tuned configuration
+  (`-c 262144 -ncmoe 37 cache=3072`) produce the identical hash,
+  `93D901510340C646AF3A51BBA614D799CF3882708FB21C31F0A5DA98E0F84312`, every time.
+- **Coherent, not corrupted** - the generated text on both sides of the divergence point
+  is normal, well-formed prose; nothing resembling truncation, repetition loops, or
+  garbage was observed.
+- **Every safety counter stays clean** at every `-ncmoe` value tested (31 through 40):
+  `pins==unpins`, `current_pins=0`, `resolver_failures=0`, `short_read_count=0`,
+  `invalid_unpins=0`.
+
+**Best-supported explanation, not confirmed:** the same small, non-zero logit
+differences documented in §1 above for the EXACT profiles at their own tested settings,
+now large enough - after enough MoE layers are pushed through the external path instead
+of staying resident - to flip one of the model's near-tied greedy decisions. This was
+never observed before because `-ncmoe > 30` had never been exercised at a generation
+length long enough to reach that decision point.
+
+**Not claimed:** that the mechanism above is proven, or that quality is degraded in any
+way beyond the token-stream difference itself. No perplexity measurement was taken for
+this class (unlike REPACK's four-corpus check) - only the greedy hash and coherence were
+verified.
+
+**Classification:** `LONG_CONTEXT_LOW_RAM`, not `EXACT` and not `REPACK` (it does not use
+the repack kernels; the numeric divergence has a different, still-unproven cause). Never
+call a `-ncmoe > 30` configuration EXACT without re-verifying the 512-token hash for that
+specific configuration - `PROFILES.md`'s long-context table and `LONG_CONTEXT.md` section
+3 have the details.
+
+---
+
 ## 9. Reproducing the correctness check
 
 ```powershell

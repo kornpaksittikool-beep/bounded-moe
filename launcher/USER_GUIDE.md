@@ -92,6 +92,26 @@ working set ≈ 0.94 GiB + expert cache size
 so `LLAMA_EXPERT_CACHE_MB=2560` gives about 3.44 GiB. That relationship held constant
 from a 256 MiB cache upward in testing.
 
+### Long context
+
+Three more profiles push context from 16384 up to the model's native 262144, with RAM
+still bounded - run them exactly like any profile above, no extra flags:
+
+```powershell
+.\launcher\run-local-moe.ps1 -Model <gguf> -Profile LONG_CONTEXT_LOW_RAM_256K -Server
+```
+
+| profile | context | working set | reference tok/s | output |
+|---|---:|---:|---:|---|
+| `LONG_CONTEXT_LOW_RAM_64K` | 65536 | 3.97 GiB | 17.3 | deterministic, **not** bit-identical |
+| `LONG_CONTEXT_LOW_RAM_128K` | 131072 | 4.00 GiB | 16.4 | deterministic, **not** bit-identical |
+| `LONG_CONTEXT_LOW_RAM_256K` | 262144 | 4.07 GiB | 14.9 | deterministic, **not** bit-identical |
+
+None of these are EXACT (see §4 below and `docs/LONG_CONTEXT.md`) - same weights, same
+routing, but the token stream diverges from the reference past a few hundred tokens. Full
+detail, including why, and the retrieval and server validation behind these numbers, is
+in `docs/LONG_CONTEXT.md`.
+
 ---
 
 ## 4. EXACT versus REPACK

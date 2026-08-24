@@ -229,6 +229,50 @@ resource check uses the latter.
 
 ---
 
+## Long-context profiles (research, opt-in, not EXACT)
+
+Three more profiles push context from 16384 out to the model's native maximum. They are
+not part of the six-profile table above - different context, different correctness
+class, and not the default. See `docs/LONG_CONTEXT.md` for the full account (root cause
+of the `-ncmoe 40` RAM regression that was fixed to make these possible, the performance
+tuning pass, and what "not EXACT" means here precisely).
+
+| profile | context | `-ncmoe` | cache | TG (512 tok, confirmed) | Peak WS | Peak VRAM | VRAM margin |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `LONG_CONTEXT_LOW_RAM_64K` | 65536 | 32 | 3072 MiB | 17.283 +- 0.427 | 3.969 GiB | 7374 MiB | 814 MiB |
+| `LONG_CONTEXT_LOW_RAM_128K` | 131072 | 35 | 3072 MiB | 16.414 +- 0.501 | 4.002 GiB | 6977 MiB | 1211 MiB |
+| `LONG_CONTEXT_LOW_RAM_256K` | 262144 | 37 | 3072 MiB | 14.870 +- 0.171 | 4.071 GiB | 7405-7413 MiB | ~780 MiB |
+
+Each context's `-ncmoe`/cache was found independently (not carried over from another
+context) - a real per-context Pareto search, not an assumption. `256K` is the model's
+`n_ctx_train`, its architectural ceiling.
+
+**Correctness class: `LONG_CONTEXT_LOW_RAM`, not `EXACT`.** Every configuration here uses
+`-ncmoe > 30`, which was found (mid-way through this research) to diverge from the EXACT
+reference token stream at a fixed point (token 208 of this project's benchmark prompt),
+deterministically, with coherent (not corrupted) output on both sides of the divergence.
+`-ncmoe <= 30` - every profile in the table above - is unaffected. See
+`docs/CORRECTNESS.md` and `docs/LONG_CONTEXT.md` section 3 for the full mechanism and
+what is and is not proven about its cause.
+
+**A note on VRAM margin.** These figures come from `nvidia-smi`, which was found (also
+mid-way through this research) to under-report the *logical* buffer sizes llama.cpp's own
+allocator requests by roughly 1.9 GiB at 256K context, for reasons not fully explained -
+candidate causes include Windows/WDDM memory virtualization reporting only resident pages.
+Directly tested with a genuine ~44,000-token prompt run to completion (not a short
+benchmark): VRAM reached its steady value within 30 seconds of load and stayed flat for
+the remaining ~14.5 minutes of real processing - it does not climb progressively as the
+KV cache fills. Treat the VRAM margin figures above as measured and reproducible, not as
+a fully-understood accounting - see `docs/LONG_CONTEXT.md` section 4b.
+
+Run exactly like the six profiles above - no extra flags:
+
+```powershell
+.\launcher\run-local-moe.ps1 -Model <gguf> -Profile LONG_CONTEXT_LOW_RAM_256K -Server -Port 8080
+```
+
+---
+
 ## `REFERENCE_CONTROL`
 
 `profiles.json` contains a seventh entry, hidden from `-List`. It is unmodified

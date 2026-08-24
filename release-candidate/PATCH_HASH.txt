@@ -1,0 +1,2 @@
+1c9c428d3ddbdf630b0500abd945ccb58005618b5f2a1f01b9db0cdef2aa21c4 *D:/llm-v0/productization-v1/patches/0001-external-expert-cache.patch
+3b9c8c9cc0f37455cbfb4bb10c75aedced11f5d5782ae91f3fa39dd65a9d39ec *D:/llm-v0/productization-v1/patches/new-files/ggml/src/ggml-expert-indirection.cpp

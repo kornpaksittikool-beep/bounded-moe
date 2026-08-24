@@ -205,19 +205,19 @@
       "quality_class": "LONG_CONTEXT_LOW_RAM",
       "threads": 4,
       "context": 65536,
-      "n_cpu_moe": 40,
+      "n_cpu_moe": 32,
       "env": {
         "B1B_EXTERNAL_EXPERT_STORAGE": "1",
-        "B1B_EXTERNAL_MAX_LAYERS": "40",
-        "LLAMA_EXPERT_CACHE_MB": "2048"
+        "B1B_EXTERNAL_MAX_LAYERS": "32",
+        "LLAMA_EXPERT_CACHE_MB": "3072"
       },
-      "expected_peak_working_set_gib": 2.959,
-      "expected_peak_private_gib": 6.351,
-      "expected_min_available_ram_gib": 13.811,
-      "expected_peak_vram_mib": 3888,
-      "tg_reference_toks": 10.436,
+      "expected_peak_working_set_gib": 3.969,
+      "expected_peak_private_gib": 10.5,
+      "expected_min_available_ram_gib": 13.0,
+      "expected_peak_vram_mib": 7374,
+      "tg_reference_toks": 17.283,
       "tg_reference_tolerance_pct": 10,
-      "limitations": "Measured with a single run per point, not this project's alternating-build protocol (see docs/LONG_CONTEXT.md) - treat tg_reference_toks as +-10%, not +-8% like the 16384 profiles. No measured server working set for this context; budget the CLI figure plus the usual server overhead until measured. Retrieval correctness was validated at this context specifically with a ~44,000-token needle-in-haystack test, not at the full 65536-token window. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
+      "limitations": "Real, directly-measured config (J-Final Task 1), not inferred from the 256K tuning - ncmoe/cache found independently for this context and differ from the 256K profile's. VRAM margin ~814 MiB. Single run per point except the final config (confirmed 3x at 512 tokens matching this project's protocol) - treat tg_reference_toks as +-10%. No measured server working set for this context. Retrieval correctness was validated at ~44,000 tokens (at -c 65536, pre-tuning ncmoe=40/cache=2048 config), not against this exact tuned configuration. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
       "guarantees": "Deterministic output for a given prompt and seed. Diverges from the EXACT reference token stream past token ~208 of the benchmark prompt (coherent, not corrupted) - see docs/LONG_CONTEXT.md section 3."
     },
     {
@@ -226,19 +226,19 @@
       "quality_class": "LONG_CONTEXT_LOW_RAM",
       "threads": 4,
       "context": 131072,
-      "n_cpu_moe": 40,
+      "n_cpu_moe": 35,
       "env": {
         "B1B_EXTERNAL_EXPERT_STORAGE": "1",
-        "B1B_EXTERNAL_MAX_LAYERS": "40",
-        "LLAMA_EXPERT_CACHE_MB": "2048"
+        "B1B_EXTERNAL_MAX_LAYERS": "35",
+        "LLAMA_EXPERT_CACHE_MB": "3072"
       },
-      "expected_peak_working_set_gib": 2.993,
-      "expected_peak_private_gib": 7.206,
-      "expected_min_available_ram_gib": 13.602,
-      "expected_peak_vram_mib": 4736,
-      "tg_reference_toks": 10.891,
+      "expected_peak_working_set_gib": 4.002,
+      "expected_peak_private_gib": 10.7,
+      "expected_min_available_ram_gib": 12.7,
+      "expected_peak_vram_mib": 6977,
+      "tg_reference_toks": 16.414,
       "tg_reference_tolerance_pct": 10,
-      "limitations": "Same as LONG_CONTEXT_LOW_RAM_64K: single run per point, no measured server working set at this context, retrieval correctness validated at ~44,000 tokens (at -c 65536) rather than at this profile's own full window. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
+      "limitations": "Real, directly-measured config (J-Final Task 1). ncmoe=34 was screened but showed a reproducible, unexplained throughput dip at this context (~12.5-12.8 tok/s vs 35's ~14.8-16.4) and was avoided in favor of the clean, safely-margined ncmoe=35 point - flagged as an open item, not chased further. VRAM margin ~1211 MiB. Single run per point except the final config (confirmed 3x at 512 tokens). No measured server working set at this context. Retrieval correctness validated at ~44,000 tokens (at -c 65536, pre-tuning config) rather than at this profile's own window. NOT bit-identical to the EXACT reference past a few hundred tokens - see the LONG_CONTEXT_LOW_RAM correctness class above.",
       "guarantees": "Deterministic output for a given prompt and seed. Diverges from the EXACT reference token stream past token ~208 of the benchmark prompt (coherent, not corrupted) - see docs/LONG_CONTEXT.md section 3."
     },
     {

@@ -188,20 +188,73 @@ growth alone would need about 9.1 GiB). Full accounting:
 measured almost context-independent, so the same tuning likely transfers, but that is an
 extrapolation, not a measurement.
 
+## 4b. Real 64K/128K measurements, and a VRAM accounting correction
+
+A follow-on release-validation pass measured `LONG_CONTEXT_LOW_RAM_64K`/`128K`
+independently rather than extrapolating from 256K's tuning - context changes how much
+VRAM headroom is available, so the optimal `-ncmoe`/cache differs per context:
+
+| profile | `-ncmoe` | cache | TG (512 tok, 3 runs) | Peak WS | Peak VRAM | margin |
+|---|---:|---:|---:|---:|---:|---:|
+| 64K | 32 | 3072 MiB | 17.283 +- 0.427 | 3.969 GiB | 7374 MiB | 814 MiB |
+| 128K | 35 | 3072 MiB | 16.414 +- 0.501 | 4.002 GiB | 6977 MiB | 1211 MiB |
+| 256K | 37 | 3072 MiB | 14.870 +- 0.171 | 4.071 GiB | 7405-7413 MiB | ~780 MiB |
+
+One screened point (`ncmoe=34` at 128K) showed a reproducible, unexplained throughput dip
+(~12.5-12.8 tok/s versus 35's clean ~14.8-16.4) and was avoided in favor of the safely-
+margined `ncmoe=35` - not chased further, flagged as an open item.
+
+**Separately, an important correction to the VRAM story.** The theoretical prediction
+that `-ncmoe 30` would exceed VRAM at 262144 context (repeated throughout this document's
+earlier drafts) turned out to be **wrong**. Directly tested three ways - a short gate, a
+genuine ~44,000-token prompt run to full completion (~15 minutes), and a standard
+512-token throughput measurement - `-ncmoe 30` at `-c 262144` **does not OOM**: peak VRAM
+measured 7678-7772 MiB, under the 8188 MiB card. The VRAM-fill test found the reading
+reaches its steady value within 30 seconds of load and then stays flat (within a 28 MiB
+band) for the remaining ~14.5 minutes of real prompt processing - it does **not** climb
+progressively as the KV cache fills, ruling out a lazy-commit explanation.
+
+**Why `nvidia-smi`'s reading (~7770 MiB) is ~1.9 GiB below llama.cpp's own logged
+*logical* allocation (9679.41 MiB, independently confirmed component by component via
+`llama-cli -v`) is not established.** Candidate explanations not chased down: Windows
+WDDM memory virtualization reporting only resident pages rather than the full
+reservation; CUDA allocator suballocation/pooling between buffers the log reports
+separately. Treat the `VRAM_fixed + slope*context` formula elsewhere in this project's
+docs as a correctly-derived *logical* upper bound, not a reliable predictor of *physical*
+`nvidia-smi` usage on this Windows/WDDM setup.
+
+**This does not change the recommendation.** Measured head-to-head at 262144 context,
+`-ncmoe 37` beats `-ncmoe 30` on every axis: TG 14.870 vs 13.267 (+12.1%), Peak WS 4.07 vs
+6.2 GiB, VRAM margin ~780 vs ~450-510 MiB. `-ncmoe 30` simply performs worse at this
+context regardless of the OOM question, which was the wrong reason but not the wrong
+conclusion. Full account:
+`autonomous-research/long-context-perf-research/LONG_CONTEXT_VRAM_COMMIT_FINDING.md`.
+
+**Practical implication for the six 16384-context profiles.** Because they all share
+`-ncmoe 30` (`profiles.json`'s `common.n_cpu_moe`), this finding suggests their VRAM
+footprint alone would likely *not* crash at 262144 context either - contrary to what an
+earlier pass concluded. They would, however, still be slower and use more RAM than the
+tuned long-context profiles. `MAX_SPEED_EXACT`'s and `MAX_SPEED_REPACK`'s *other*
+dimension (how much of their CPU-placed weight is bounded-cached versus fully
+CPU-RAM-resident) was not retested at 262144 and is a separate, RAM-side question this
+VRAM finding does not answer.
+
 ## 5. What is not yet validated
 
-- **Retrieval depth.** The 44,000-token retrieval test is real evidence against silent
-  truncation or corruption, but it is not a test of the full 262144-token window - a
-  haystack that large would take on the order of an hour of prompt processing at this
-  hardware's real throughput (~40-65 tok/s on realistic prompts) and was not run.
-- **Thai, code, and multi-turn long-context retrieval specifically.** The server
-  validation exercises code and multi-turn briefly, at short context. A long-context
-  version of each (a fact planted deep in a large code file, or accumulated across many
-  turns toward 64K+ tokens) has not been run.
-- **Cache hit-rate / SSD-traffic accounting for the 40-layer path.** This project's
-  existing loads/token and MiB/token figures (`ARCHITECTURE.md`, `PERFORMANCE.md`) are
-  for the 30-layer configuration. The cache's own mechanics did not change, but a
-  dedicated 40-layer accounting pass has not been re-run.
+- **Retrieval depth: resolved.** A follow-on pass planted five independent needles
+  (English, Thai, and YAML/code content) at approximately 10K, 64K, 128K, 200K, and 245K
+  tokens - 94% of the 262144-token window - in a query order decoupled from the planting
+  order. All five came back exact, with correct source attribution, at real PP throughput
+  of 46.3 tok/s. See `autonomous-research/long-context-perf-research/LONG_CONTEXT_DEEP_RETRIEVAL.md`.
+- **Thai, code, and multi-turn long-context retrieval independently at extreme depth.**
+  The deep-retrieval test above covers Thai and code *content type*, but does not
+  independently vary depth for each (all three needle types were tested at their own
+  single depth, not swept). A dedicated multi-turn conversation accumulated toward
+  64K+ tokens has not been run.
+- **Cache hit-rate / SSD-traffic accounting for the tuned `-ncmoe` values.** This
+  project's existing loads/token and MiB/token figures (`ARCHITECTURE.md`,
+  `PERFORMANCE.md`) are for the original 30-layer configuration at 16384 context. A
+  dedicated accounting pass at the tuned 64K/128K/256K `-ncmoe` values has not been run.
 - **An unexplained pattern:** TG rises with context at a fixed cache size (e.g. 8.7 tok/s
   at 64K, 11.5 tok/s at 256K, both at `cache=1024`). The most likely explanation is
   ordinary run-to-run drift (this project's own documented ~5 % machine variance) rather
