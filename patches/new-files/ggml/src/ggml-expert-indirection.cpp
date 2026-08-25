@@ -2051,11 +2051,13 @@ extern "C" const char * ggml_expert_resolve_ptr(const struct ggml_tensor * src0,
     const uint64_t b2d_resolve = b2d_sample ? b2d_now() : 0;
 #if B1R4_COMPILE_OUT_DIAGNOSTICS && !B1U_PROFILE
     const bool b1p_sample = false;
-    const bool mmid_resolver_sample = false;
 #else
     const bool b1p_sample = (B1U_PROFILE ? ((call_number & 65535u) == 0) : (ggml_expert_b1p_profile_env() && ((call_number & B1P_SAMPLE_MASK) == 0)));
-    const bool mmid_resolver_sample = ggml_expert_mmid_profile_enabled() && ((call_number & 63u) == 0);
 #endif
+    // ggml_expert_mmid_profile_enabled() self-gates on LLAMA_EXPERT_DECOMP and is not
+    // covered by B1R4_COMPILE_OUT_DIAGNOSTICS (see its definition), unlike b1p_sample
+    // above - it must not be forced false in the branch that disables b1p_sample.
+    const bool mmid_resolver_sample = ggml_expert_mmid_profile_enabled() && ((call_number & 63u) == 0);
     const uint64_t b1p_resolver_start = b1p_sample ? lock_now_ns() : 0;
     const uint64_t mmid_resolver_start_ns = mmid_resolver_sample ? ggml_expert_mmid_now_ns() : 0;
     if (b1p_sample) ++g_b1p_resolver_samples;
